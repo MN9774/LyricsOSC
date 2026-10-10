@@ -22,6 +22,8 @@ if(NOT SDK_SRC)
   message(FATAL_ERROR "No se encontraron fuentes del SDK FFGL en ${FFGL_DIR}/source/lib")
 endif()
 
+find_package(GLEW REQUIRED)
+
 add_library(LyricsOSC SHARED
   src/Lyrics.cpp
   src/LyricsCore.cpp
@@ -30,7 +32,7 @@ add_library(LyricsOSC SHARED
 
 set_target_properties(LyricsOSC PROPERTIES PREFIX "")
 target_include_directories(LyricsOSC PRIVATE ${INC_DIRS})
-target_compile_definitions(LyricsOSC PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(LyricsOSC PRIVATE _CRT_SECURE_NO_WARNINGS GLEW_STATIC)
 target_compile_options(LyricsOSC PRIVATE /utf-8 /EHsc)
 target_link_options(LyricsOSC PRIVATE /EXPORT:plugMain)
-target_link_libraries(LyricsOSC PRIVATE opengl32 gdiplus ws2_32 shell32 ole32)
+target_link_libraries(LyricsOSC PRIVATE GLEW::GLEW opengl32 gdiplus ws2_32 shell32 ole32)

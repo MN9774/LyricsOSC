@@ -1,0 +1,32 @@
+name: Compilar plugin
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descargar SDK FFGL de Resolume
+        run: git clone --depth 1 https://github.com/resolume/ffgl.git ffgl-sdk
+
+      - name: Configurar
+        run: cmake -S . -B build -A x64 -DFFGL_DIR=ffgl-sdk
+
+      - name: Compilar
+        run: cmake --build build --config Release
+
+      - name: Preparar descarga
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item build/Release/LyricsOSC.dll out/
+          Copy-Item -Recurse canciones_ejemplo out/canciones_ejemplo
+          Copy-Item LEEME.txt out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LyricsOSC
+          path: out

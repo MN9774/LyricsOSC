@@ -1,0 +1,36 @@
+LYRICS OSC - plugin FFGL para Resolume Arena 7
+================================================
+
+INSTALAR
+1. Copia LyricsOSC.dll a:  Documentos\Resolume Arena\Extra Effects
+2. Copia la carpeta de canciones: pon tus .txt en
+   Documentos\Resolume Arena\Lyrics   (se crea sola al abrir Resolume;
+   puedes copiar ahi canciones_ejemplo\Ejemplo.txt)
+3. Reinicia Resolume. El plugin esta en Sources > FFGL > "Lyrics OSC".
+   Arrastralo a una capa.
+
+FORMATO DE LAS LETRAS (.txt, UTF-8 o ANSI)
+- Una estrofa = un bloque de lineas. Los bloques se separan con una linea en blanco.
+- Para usar otra tipografia en una estrofa, la primera linea del bloque:
+      #font=Nombre de la fuente
+- Al cargar una cancion no se muestra nada hasta que pulsas Next.
+
+PARAMETROS EN RESOLUME
+Font, Size, Hue/Saturation/Darken (color), Align, Position (0 = abajo, 0.5 = centro, 1 = arriba),
+Line Spacing, Bold, Italic, Song (lista de .txt), Stanza (slider), Next, Previous, Blank.
+Todos se pueden mapear a OSC/MIDI con los atajos de Resolume.
+Por defecto el color es blanco, el texto es pequeno y esta abajo: ajusta Size y Position.
+
+OSC PROPIO (UDP, puerto 8000)
+  /lyrics/next            siguiente estrofa
+  /lyrics/prev            anterior
+  /lyrics/goto  n         ir a la estrofa n (1 = primera)
+  /lyrics/clear           ocultar texto        /lyrics/show   mostrar
+  /lyrics/blank 0|1
+  /lyrics/text  "texto"   mostrar texto suelto (\n = salto de linea)
+  /lyrics/font  "Arial Black"   o un numero (posicion en la lista)
+  /lyrics/song  n         cargar la cancion n de la carpeta (0 = ninguna)
+  /lyrics/load  "nombre.txt"    cargar un archivo (ruta completa o dentro de Lyrics)
+Para cambiar el puerto, crea Documentos\Resolume Arena\Lyrics\osc_port.txt con el numero.
+Si hay varias capas con el plugin, los mensajes /lyrics/... llegan a todas; para
+controlarlas por separado usa los parametros normales de Resolume (OSC nativo de cada clip).

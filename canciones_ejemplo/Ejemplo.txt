@@ -1,0 +1,12 @@
+Primera estrofa de prueba
+segunda linea de la estrofa
+
+#font=Impact
+ESTA ESTROFA USA OTRA TIPOGRAFIA
+(la etiqueta #font= va en la primera linea)
+
+Tercera estrofa
+con acentos: canción, corazón, niño
+
+#font=Times New Roman
+Ultima estrofa

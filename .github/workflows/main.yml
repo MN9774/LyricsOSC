@@ -12,8 +12,11 @@ jobs:
       - name: Descargar SDK FFGL de Resolume
         run: git clone --depth 1 https://github.com/resolume/ffgl.git ffgl-sdk
 
+      - name: Instalar GLEW
+        run: vcpkg install glew:x64-windows-static
+
       - name: Configurar
-        run: cmake -S . -B build -A x64 -DFFGL_DIR=ffgl-sdk
+        run: cmake -S . -B build -A x64 -DFFGL_DIR=ffgl-sdk -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
       - name: Compilar
         run: cmake --build build --config Release

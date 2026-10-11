@@ -60,25 +60,6 @@ std::wstring LyricsDir()
     return dir;
 }
 
-std::vector<std::wstring> ListSongFiles()
-{
-    std::vector<std::wstring> files;
-    std::wstring dir = LyricsDir();
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((dir + L"\\*.txt").c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                files.push_back(dir + L"\\" + fd.cFileName);
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    std::sort(files.begin(), files.end(), [](const std::wstring& a, const std::wstring& b) {
-        return _wcsicmp(a.c_str(), b.c_str()) < 0;
-    });
-    return files;
-}
-
 static std::wstring Trim(const std::wstring& s)
 {
     size_t a = 0, b = s.size();
@@ -87,38 +68,33 @@ static std::wstring Trim(const std::wstring& s)
     return s.substr(a, b - a);
 }
 
-static std::vector<Stanza> ParseStanzas(const std::wstring& raw)
+// Divide la letra en lineas: salto de linea, "|" o el texto literal \n.
+// Las lineas en blanco SE CONSERVAN: son un paso en el que no se ve texto.
+// Solo se descartan las lineas vacias del final (un salto de linea de mas al pegar).
+static std::vector<std::wstring> SplitLines(std::wstring raw)
 {
-    std::vector<Stanza> out;
-    std::vector<std::wstring> block;
-
-    auto flush = [&]() {
-        if (block.empty()) return;
-        Stanza st;
-        size_t first = 0;
-        std::wstring head = Trim(block[0]);
-        if (head.size() > 6 && _wcsnicmp(head.c_str(), L"#font=", 6) == 0) {
-            st.font = Trim(head.substr(6));
-            first = 1;
-        }
-        std::wstring text;
-        for (size_t i = first; i < block.size(); i++) {
-            if (!text.empty()) text += L'\n';
-            text += block[i];
-        }
-        st.text = Trim(text);
-        if (!st.text.empty()) out.push_back(st);
-        block.clear();
-    };
-
-    std::wstringstream ss(raw);
-    std::wstring line;
-    while (std::getline(ss, line)) {
-        while (!line.empty() && line.back() == L'\r') line.pop_back();
-        if (Trim(line).empty()) flush();
-        else block.push_back(line);
+    size_t p = 0;
+    while ((p = raw.find(L"\\n", p)) != std::wstring::npos) {
+        raw.replace(p, 2, L"\n");
+        p += 1;
     }
-    flush();
+    p = 0;
+    while ((p = raw.find(L"\r\n", p)) != std::wstring::npos) raw.replace(p, 2, L"\n");
+    for (auto& ch : raw)
+        if (ch == L'\r' || ch == 0x2028 || ch == 0x2029) ch = L'\n';
+
+    std::vector<std::wstring> out;
+    std::wstring cur;
+    for (wchar_t ch : raw) {
+        if (ch == L'\n' || ch == L'|') {
+            out.push_back(Trim(cur));
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    out.push_back(Trim(cur));
+    while (!out.empty() && out.back().empty()) out.pop_back();
     return out;
 }
 
@@ -199,18 +175,18 @@ void Apply(LyricsState* s, const std::string& addr, const std::vector<OscArg>& a
 {
     if (addr == "/lyrics/next") { if (Pressed(a)) s->Next(); }
     else if (addr == "/lyrics/prev") { if (Pressed(a)) s->Prev(); }
+    else if (addr == "/lyrics/restart") { if (Pressed(a)) s->Restart(); }
     else if (addr == "/lyrics/clear") { if (Pressed(a)) s->SetBlank(true); }
     else if (addr == "/lyrics/show") { if (Pressed(a)) s->SetBlank(false); }
     else if (addr == "/lyrics/blank") { s->SetBlank(AsInt(a, 1) != 0); }
-    else if (addr == "/lyrics/goto") { s->Goto(AsInt(a, 1) - 1); }
+    else if (addr == "/lyrics/goto") { s->Goto(AsInt(a, 0)); }
     else if (addr == "/lyrics/text") {
-        if (!a.empty() && a[0].t == 's') s->SetDirectText(ReplaceNewlines(Utf8ToW(a[0].s)));
+        if (!a.empty() && a[0].t == 's') s->SetLyrics(Utf8ToW(a[0].s));
     }
     else if (addr == "/lyrics/font") {
         if (a.empty()) return;
         if (a[0].t == 's') {
             std::wstring want = Utf8ToW(a[0].s);
-            // buscar coincidencia exacta (sin distinguir mayusculas) en las instaladas
             for (auto& f : render::InstalledFonts())
                 if (_wcsicmp(f.c_str(), want.c_str()) == 0) { want = f; break; }
             s->SetFont(want);
@@ -220,26 +196,13 @@ void Apply(LyricsState* s, const std::string& addr, const std::vector<OscArg>& a
             if (n >= 0 && n < (int)fonts.size()) s->SetFont(fonts[(size_t)n]);
         }
     }
-    else if (addr == "/lyrics/song") {
-        int n = AsInt(a, 0);
-        if (n <= 0) { s->Clear(); return; }
-        auto files = ListSongFiles();
-        if (n <= (int)files.size()) s->LoadFile(files[(size_t)n - 1]);
-    }
-    else if (addr == "/lyrics/load") {
-        if (!a.empty() && a[0].t == 's') {
-            std::wstring p = Utf8ToW(a[0].s);
-            if (p.find(L':') == std::wstring::npos && p.find(L"\\\\") != 0)
-                p = LyricsDir() + L"\\" + p; // ruta relativa -> carpeta Lyrics
-            s->LoadFile(p);
-        }
-    }
 }
 
 void Dispatch(const std::string& addr, const std::vector<OscArg>& args)
 {
     std::lock_guard<std::mutex> lk(gMtx);
-    for (auto* inst : gInst) Apply(inst, addr, args);
+    for (auto* inst : gInst)
+        if (inst->IsActive()) Apply(inst, addr, args);
 }
 
 void HandlePacket(const char* buf, int len)
@@ -349,38 +312,39 @@ void Unregister(LyricsState* s)
 LyricsState::LyricsState() { Register(this); }
 LyricsState::~LyricsState() { Unregister(this); }
 
+void LyricsState::SetLyrics(const std::wstring& raw)
+{
+    std::vector<std::wstring> lines = SplitLines(raw);
+    std::lock_guard<std::mutex> lk(m_);
+    if (lines == lines_) return;
+    lines_ = std::move(lines);
+    if (idx_ >= (int)lines_.size()) idx_ = (int)lines_.size() - 1;
+}
+
 void LyricsState::Next()
 {
     std::lock_guard<std::mutex> lk(m_);
-    direct_ = false;
-    if (idx_ + 1 < (int)st_.size()) idx_++;
+    if (idx_ + 1 < (int)lines_.size()) idx_++;
 }
 
 void LyricsState::Prev()
 {
     std::lock_guard<std::mutex> lk(m_);
-    direct_ = false;
-    if (idx_ > 0) idx_--;
+    if (idx_ >= 0) idx_--;
 }
 
-void LyricsState::Goto(int i)
+void LyricsState::Restart()
 {
     std::lock_guard<std::mutex> lk(m_);
-    if (st_.empty()) return;
-    direct_ = false;
-    if (i < 0) i = 0;
-    if (i >= (int)st_.size()) i = (int)st_.size() - 1;
-    idx_ = i;
+    idx_ = -1;
 }
 
-void LyricsState::GotoNormalized(float v)
+void LyricsState::Goto(int n1)
 {
-    int n;
-    { std::lock_guard<std::mutex> lk(m_); n = (int)st_.size(); }
-    if (n <= 0) return;
-    if (v < 0) v = 0;
-    if (v > 1) v = 1;
-    Goto((int)std::lround(v * (float)(n - 1)));
+    std::lock_guard<std::mutex> lk(m_);
+    if (n1 < 0) n1 = 0;
+    if (n1 > (int)lines_.size()) n1 = (int)lines_.size();
+    idx_ = n1 - 1;
 }
 
 void LyricsState::SetBlank(bool b)
@@ -389,44 +353,18 @@ void LyricsState::SetBlank(bool b)
     blank_ = b;
 }
 
-void LyricsState::SetDirectText(const std::wstring& t)
-{
-    std::lock_guard<std::mutex> lk(m_);
-    directText_ = t;
-    direct_ = true;
-    blank_ = false;
-}
-
 void LyricsState::SetFont(const std::wstring& f)
 {
     std::lock_guard<std::mutex> lk(m_);
     if (!f.empty()) font_ = f;
 }
 
-bool LyricsState::LoadFile(const std::wstring& path)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::stringstream buf;
-    buf << f.rdbuf();
-    std::string bytes = buf.str();
-    if (bytes.size() >= 3 && (uint8_t)bytes[0] == 0xEF && (uint8_t)bytes[1] == 0xBB &&
-        (uint8_t)bytes[2] == 0xBF)
-        bytes.erase(0, 3);
-    std::vector<Stanza> parsed = ParseStanzas(Utf8ToW(bytes));
-    std::lock_guard<std::mutex> lk(m_);
-    st_ = std::move(parsed);
-    idx_ = -1; // no muestra nada hasta el primer "Next"
-    direct_ = false;
-    return true;
-}
+void LyricsState::Touch() { lastTouch_.store(GetTickCount64()); }
 
-void LyricsState::Clear()
+bool LyricsState::IsActive() const
 {
-    std::lock_guard<std::mutex> lk(m_);
-    st_.clear();
-    idx_ = -1;
-    direct_ = false;
+    unsigned long long t = lastTouch_.load();
+    return t != 0 && (GetTickCount64() - t) < 1500ULL;
 }
 
 LyricsState::View LyricsState::GetView()
@@ -434,13 +372,8 @@ LyricsState::View LyricsState::GetView()
     std::lock_guard<std::mutex> lk(m_);
     View v;
     v.blank = blank_;
-    if (direct_) {
-        v.text = directText_;
-    } else if (idx_ >= 0 && idx_ < (int)st_.size()) {
-        v.text = st_[(size_t)idx_].text;
-        v.font = st_[(size_t)idx_].font;
-    }
-    if (v.font.empty()) v.font = font_;
+    if (idx_ >= 0 && idx_ < (int)lines_.size()) v.text = lines_[(size_t)idx_];
+    v.font = font_;
     return v;
 }
 

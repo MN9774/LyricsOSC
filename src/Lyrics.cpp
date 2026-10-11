@@ -15,7 +15,11 @@
 using namespace ffglex;
 
 enum ParamID : FFUInt32 {
-    P_FONT = 0,
+    P_TEXT = 0,   // cuadro de texto con la letra (una linea = un paso)
+    P_RESTART,    // boton: vuelve a "nada en pantalla"
+    P_PREV,       // boton: linea anterior
+    P_NEXT,       // boton: linea siguiente
+    P_FONT,
     P_SIZE,
     P_HUE,
     P_SAT,
@@ -25,11 +29,6 @@ enum ParamID : FFUInt32 {
     P_SPACING,
     P_BOLD,
     P_ITALIC,
-    P_SONG,
-    P_STANZA,
-    P_NEXT,
-    P_PREV,
-    P_BLANK,
     P_COUNT
 };
 
@@ -99,15 +98,18 @@ public:
     FFResult DeInitGL() override;
     FFResult SetFloatParameter(unsigned int dwIndex, float value) override;
     float GetFloatParameter(unsigned int index) override;
+    FFResult SetTextParameter(unsigned int index, const char* value) override;
+    char* GetTextParameter(unsigned int index) override;
 
 private:
     lyr::LyricsState state_;
     std::vector<std::wstring> fonts_;
-    std::vector<std::wstring> songs_;
 
     std::mutex mu_;
     float values_[P_COUNT];
-    bool prevNext_ = false, prevPrev_ = false;
+    bool high_[P_COUNT];
+    std::string textUtf8_;
+    std::string emptyText_;
 
     FFGLShader shader_;
     GLuint tex_ = 0;
@@ -124,7 +126,7 @@ static CFFGLPluginInfo PluginInfo(
     2, 1,
     1, 0,
     FF_SOURCE,
-    "Letras con varias tipografias y control por OSC",
+    "Letras linea por linea con varias tipografias y control por OSC",
     "Lyrics OSC");
 
 LyricsPlugin::LyricsPlugin()
@@ -132,8 +134,17 @@ LyricsPlugin::LyricsPlugin()
     SetMinInputs(0);
     SetMaxInputs(0);
 
-    for (int i = 0; i < P_COUNT; i++) values_[i] = 0.0f;
+    for (int i = 0; i < P_COUNT; i++) { values_[i] = 0.0f; high_[i] = false; }
 
+    // Cuadro de texto: aqui se pega la letra de la cancion (una linea = un paso)
+    SetParamInfo(P_TEXT, "Lyrics", FF_TYPE_TEXT, (const char*)"");
+
+    // Botones de pulsar y soltar (trigger)
+    SetParamInfof(P_RESTART, "Restart", FF_TYPE_EVENT);
+    SetParamInfof(P_PREV, "Prev", FF_TYPE_EVENT);
+    SetParamInfof(P_NEXT, "Next", FF_TYPE_EVENT);
+
+    // Tipografia: todas las fuentes instaladas en Windows
     fonts_ = render::InstalledFonts();
     if (fonts_.size() > 500) fonts_.resize(500);
     int defFont = 0;
@@ -141,18 +152,15 @@ LyricsPlugin::LyricsPlugin()
         if (_wcsicmp(fonts_[i].c_str(), L"Arial") == 0) { defFont = (int)i; break; }
     values_[P_FONT] = (float)defFont;
     state_.SetFont(fonts_[(size_t)defFont]);
-
-    songs_ = lyr::ListSongFiles();
-
-    // Fuente (lista de todas las tipografias instaladas)
     SetOptionParamInfo(P_FONT, "Font", (unsigned int)fonts_.size(), (float)defFont);
     for (size_t i = 0; i < fonts_.size(); i++)
         SetParamElementInfo(P_FONT, (unsigned int)i, lyr::WToUtf8(fonts_[i]).c_str(), (float)i);
 
-    SetParamInfof(P_SIZE, "Size", FF_TYPE_STANDARD);
-    SetParamInfof(P_HUE, "Hue", FF_TYPE_STANDARD);
-    SetParamInfof(P_SAT, "Saturation", FF_TYPE_STANDARD);
-    SetParamInfof(P_DARK, "Darken", FF_TYPE_STANDARD);
+    values_[P_SIZE] = 0.3f;
+    SetParamInfo(P_SIZE, "Size", FF_TYPE_STANDARD, 0.3f);
+    SetParamInfo(P_HUE, "Hue", FF_TYPE_STANDARD, 0.0f);
+    SetParamInfo(P_SAT, "Saturation", FF_TYPE_STANDARD, 0.0f);
+    SetParamInfo(P_DARK, "Darken", FF_TYPE_STANDARD, 0.0f);
 
     values_[P_ALIGN] = 1.0f;
     SetOptionParamInfo(P_ALIGN, "Align", 3, 1.0f);
@@ -160,28 +168,11 @@ LyricsPlugin::LyricsPlugin()
     SetParamElementInfo(P_ALIGN, 1, "Center", 1.0f);
     SetParamElementInfo(P_ALIGN, 2, "Right", 2.0f);
 
-    SetParamInfof(P_POS, "Position", FF_TYPE_STANDARD);
-    SetParamInfof(P_SPACING, "Line Spacing", FF_TYPE_STANDARD);
+    values_[P_POS] = 0.5f;
+    SetParamInfo(P_POS, "Position", FF_TYPE_STANDARD, 0.5f);
+    SetParamInfo(P_SPACING, "Line Spacing", FF_TYPE_STANDARD, 0.0f);
     SetParamInfof(P_BOLD, "Bold", FF_TYPE_BOOLEAN);
     SetParamInfof(P_ITALIC, "Italic", FF_TYPE_BOOLEAN);
-
-    // Canciones: "(ninguna)" + los .txt de Documentos\Resolume Arena\Lyrics
-    unsigned int nSongs = (unsigned int)std::min<size_t>(songs_.size(), 200);
-    SetOptionParamInfo(P_SONG, "Song", nSongs + 1, 0.0f);
-    SetParamElementInfo(P_SONG, 0, "(none)", 0.0f);
-    for (unsigned int i = 0; i < nSongs; i++) {
-        std::wstring name = songs_[i];
-        size_t sl = name.find_last_of(L"\\/");
-        if (sl != std::wstring::npos) name = name.substr(sl + 1);
-        size_t dot = name.find_last_of(L'.');
-        if (dot != std::wstring::npos) name = name.substr(0, dot);
-        SetParamElementInfo(P_SONG, i + 1, lyr::WToUtf8(name).c_str(), (float)(i + 1));
-    }
-
-    SetParamInfof(P_STANZA, "Stanza", FF_TYPE_STANDARD);
-    SetParamInfof(P_NEXT, "Next", FF_TYPE_BOOLEAN);
-    SetParamInfof(P_PREV, "Previous", FF_TYPE_BOOLEAN);
-    SetParamInfof(P_BLANK, "Blank", FF_TYPE_BOOLEAN);
 }
 
 FFResult LyricsPlugin::InitGL(const FFGLViewportStruct* vp)
@@ -219,6 +210,7 @@ FFResult LyricsPlugin::DeInitGL()
 FFResult LyricsPlugin::SetFloatParameter(unsigned int idx, float value)
 {
     if (idx >= P_COUNT) return FF_FAIL;
+    if (idx == P_TEXT) return FF_SUCCESS;
     {
         std::lock_guard<std::mutex> lk(mu_);
         values_[idx] = value;
@@ -229,26 +221,19 @@ FFResult LyricsPlugin::SetFloatParameter(unsigned int idx, float value)
         if (i >= 0 && i < (int)fonts_.size()) state_.SetFont(fonts_[(size_t)i]);
         break;
     }
-    case P_SONG: {
-        int i = (int)std::lround(value);
-        if (i <= 0) state_.Clear();
-        else if (i - 1 < (int)songs_.size()) state_.LoadFile(songs_[(size_t)i - 1]);
-        break;
-    }
-    case P_STANZA: state_.GotoNormalized(value); break;
+    case P_RESTART:
+    case P_PREV:
     case P_NEXT: {
+        // Trigger: actua una sola vez en el flanco de subida (al pulsar)
         bool high = value > 0.5f;
-        if (high && !prevNext_) state_.Next();
-        prevNext_ = high;
+        if (high && !high_[idx]) {
+            if (idx == P_RESTART) state_.Restart();
+            else if (idx == P_PREV) state_.Prev();
+            else state_.Next();
+        }
+        high_[idx] = high;
         break;
     }
-    case P_PREV: {
-        bool high = value > 0.5f;
-        if (high && !prevPrev_) state_.Prev();
-        prevPrev_ = high;
-        break;
-    }
-    case P_BLANK: state_.SetBlank(value > 0.5f); break;
     default: break;
     }
     return FF_SUCCESS;
@@ -261,6 +246,24 @@ float LyricsPlugin::GetFloatParameter(unsigned int index)
     return values_[index];
 }
 
+// Resolume envia el texto en CADA fotograma: solo reaccionamos si cambio.
+FFResult LyricsPlugin::SetTextParameter(unsigned int index, const char* value)
+{
+    if (index != P_TEXT) return FF_FAIL;
+    if (!value) return FF_SUCCESS;
+    if (textUtf8_ != value) {
+        textUtf8_ = value;
+        state_.SetLyrics(lyr::Utf8ToW(textUtf8_));
+    }
+    return FF_SUCCESS;
+}
+
+char* LyricsPlugin::GetTextParameter(unsigned int index)
+{
+    if (index == P_TEXT) return const_cast<char*>(textUtf8_.c_str());
+    return const_cast<char*>(emptyText_.c_str());
+}
+
 FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
 {
     float v[P_COUNT];
@@ -268,6 +271,7 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
         std::lock_guard<std::mutex> lk(mu_);
         for (int i = 0; i < P_COUNT; i++) v[i] = values_[i];
     }
+    state_.Touch();
     lyr::LyricsState::View view = state_.GetView();
 
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);

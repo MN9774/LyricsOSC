@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -8,32 +9,32 @@ namespace lyr {
 std::wstring Utf8ToW(const std::string& s);
 std::string WToUtf8(const std::wstring& s);
 
-// Documentos\Resolume Arena\Lyrics  (se crea si no existe)
+// Documentos\Resolume Arena\Lyrics  (solo para el archivo opcional osc_port.txt)
 std::wstring LyricsDir();
-// Rutas completas de los .txt de esa carpeta, ordenadas por nombre
-std::vector<std::wstring> ListSongFiles();
 
-struct Stanza {
-    std::wstring text;
-    std::wstring font; // vacio = fuente por defecto
-};
-
-// Estado de una instancia del plugin. Se controla desde Resolume (parametros)
-// y desde OSC (puerto UDP, por defecto 8000). Thread-safe.
+// Estado de una instancia (un clip) del plugin.
+// La letra se pasa como texto; cada linea no vacia es un "paso".
+//   indice -1 = no se muestra nada ("linea 0")
+//   Next    -> avanza a la siguiente linea
+//   Prev    -> retrocede una linea (desde la linea 1 vuelve a "nada")
+//   Restart -> vuelve a "nada"
 class LyricsState {
 public:
     LyricsState();
     ~LyricsState();
 
+    void SetLyrics(const std::wstring& raw);
     void Next();
     void Prev();
-    void Goto(int index0);
-    void GotoNormalized(float v);
+    void Restart();
+    void Goto(int n1); // 1 = primera linea, 0 = nada
     void SetBlank(bool b);
-    void SetDirectText(const std::wstring& t);
     void SetFont(const std::wstring& f);
-    bool LoadFile(const std::wstring& path);
-    void Clear();
+
+    // El plugin llama a Touch() en cada fotograma. Los mensajes OSC globales
+    // solo llegan a clips que se estan reproduciendo (activos).
+    void Touch();
+    bool IsActive() const;
 
     struct View {
         std::wstring text;
@@ -44,12 +45,11 @@ public:
 
 private:
     std::mutex m_;
-    std::vector<Stanza> st_;
+    std::vector<std::wstring> lines_;
     int idx_ = -1;
     bool blank_ = false;
-    bool direct_ = false;
-    std::wstring directText_;
     std::wstring font_ = L"Arial";
+    std::atomic<unsigned long long> lastTouch_{0};
 };
 
 } // namespace lyr

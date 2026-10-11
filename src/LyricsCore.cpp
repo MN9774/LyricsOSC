@@ -397,19 +397,19 @@ void LyricsState::SetLyrics(const std::wstring& raw)
 void LyricsState::Next()
 {
     std::lock_guard<std::mutex> lk(m_);
-    if (idx_ + 1 < (int)lines_.size()) idx_++;
+    if (idx_ + 1 < (int)lines_.size()) { idx_++; serial_++; }
 }
 
 void LyricsState::Prev()
 {
     std::lock_guard<std::mutex> lk(m_);
-    if (idx_ >= 0) idx_--;
+    if (idx_ >= 0) { idx_--; serial_++; }
 }
 
 void LyricsState::Restart()
 {
     std::lock_guard<std::mutex> lk(m_);
-    idx_ = -1;
+    if (idx_ != -1) { idx_ = -1; serial_++; }
 }
 
 void LyricsState::Goto(int n1)
@@ -417,13 +417,13 @@ void LyricsState::Goto(int n1)
     std::lock_guard<std::mutex> lk(m_);
     if (n1 < 0) n1 = 0;
     if (n1 > (int)lines_.size()) n1 = (int)lines_.size();
-    idx_ = n1 - 1;
+    if (idx_ != n1 - 1) { idx_ = n1 - 1; serial_++; }
 }
 
 void LyricsState::SetBlank(bool b)
 {
     std::lock_guard<std::mutex> lk(m_);
-    blank_ = b;
+    if (blank_ != b) { blank_ = b; serial_++; }
 }
 
 void LyricsState::SetFont(const std::wstring& f)
@@ -452,6 +452,7 @@ LyricsState::View LyricsState::GetView()
     std::lock_guard<std::mutex> lk(m_);
     View v;
     v.blank = blank_;
+    v.serial = serial_;
     if (idx_ >= 0 && idx_ < (int)lines_.size()) v.text = lines_[(size_t)idx_];
     v.font = font_;
     return v;

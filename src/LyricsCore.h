@@ -49,6 +49,7 @@ public:
         std::wstring text;
         std::wstring font;
         bool blank = false;
+        unsigned long long serial = 0; // sube cada vez que cambia de linea (para animar)
     };
     View GetView();
 
@@ -59,6 +60,7 @@ private:
     bool blank_ = false;
     std::wstring font_ = L"Arial";
     std::atomic<unsigned long long> lastTouch_{0};
+    unsigned long long serial_ = 0;
 };
 
 } // namespace lyr

@@ -258,9 +258,21 @@ void Apply(LyricsState* s, const std::string& addr, const std::vector<OscArg>& a
 
 void Dispatch(const std::string& addr, const std::vector<OscArg>& args)
 {
-    std::lock_guard<std::mutex> lk(gMtx);
-    for (auto* inst : gInst)
-        if (inst->IsActive()) Apply(inst, addr, args);
+    static int logged = 0;
+    int active = 0;
+    {
+        std::lock_guard<std::mutex> lk(gMtx);
+        for (auto* inst : gInst) {
+            if (inst->IsActive()) {
+                active++;
+                Apply(inst, addr, args);
+            }
+        }
+    }
+    if (logged < 30) {
+        logged++;
+        Log("OSC recibido: " + addr + "  (clips activos que lo reciben: " + std::to_string(active) + ")");
+    }
 }
 
 void HandlePacket(const char* buf, int len)
@@ -314,17 +326,20 @@ void HandlePacket(const char* buf, int len)
 void ListenLoop(int port)
 {
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("ERROR: WSAStartup fallo (sin OSC propio)"); return; }
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) { WSACleanup(); return; }
+    if (s == INVALID_SOCKET) { Log("ERROR: no se pudo crear el socket UDP"); WSACleanup(); return; }
     sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((u_short)port);
     if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        Log("ERROR: no se pudo abrir el puerto UDP " + std::to_string(port) +
+            " (ocupado por otro programa). Cambialo con osc_port.txt");
         closesocket(s); WSACleanup(); return; // puerto ocupado: sin OSC propio
     }
+    Log("OSC propio escuchando en el puerto UDP " + std::to_string(port));
     DWORD tmo = 200;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
     std::vector<char> buf(16384);

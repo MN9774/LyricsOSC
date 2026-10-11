@@ -353,14 +353,16 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Texto de diagnostico cuando no hay nada que mostrar (se oculta con "Hide Status")
+    // Texto de diagnostico SOLO cuando no hay ninguna letra cargada (se oculta con "Hide Status").
+    // Las lineas en blanco y el paso 0 se quedan realmente vacios.
     if (!view.blank && view.text.empty() && v[P_HIDESTATUS] < 0.5f) {
         int n = 0, i = 0;
         state_.GetStatus(n, i);
-        std::wstring fileState = fileUtf8_.empty() ? L"-" : (fileOk_ ? L"OK" : L"NO ENCONTRADO");
-        view.text = L"[Lyrics OSC] lineas=" + std::to_wstring(n) + L"  paso=" + std::to_wstring(i) +
-                    L"  clics=" + std::to_wstring(clicks_.load()) + L"\ncaja=" +
-                    std::to_wstring(textUtf8_.size()) + L" bytes  archivo=" + fileState;
+        if (n == 0) {
+            std::wstring fileState = fileUtf8_.empty() ? L"-" : (fileOk_ ? L"OK" : L"NO ENCONTRADO");
+            view.text = L"[Lyrics OSC] sin letra cargada\nclics=" + std::to_wstring(clicks_.load()) +
+                        L"  caja=" + std::to_wstring(textUtf8_.size()) + L" bytes  archivo=" + fileState;
+        }
     }
 
     if (view.blank || view.text.empty() || w_ <= 0 || h_ <= 0 || !tex_) return FF_SUCCESS;

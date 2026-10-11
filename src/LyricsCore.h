@@ -12,6 +12,14 @@ std::string WToUtf8(const std::wstring& s);
 // Documentos\Resolume Arena\Lyrics  (solo para el archivo opcional osc_port.txt)
 std::wstring LyricsDir();
 
+// Registro de diagnostico: Documentos\Resolume Arena\Lyrics\lyrics_log.txt
+void Log(const std::string& msg);
+
+// Archivos de letra (.txt, UTF-8 o ANSI)
+bool ReadTextFile(const std::wstring& path, std::wstring& out);
+std::wstring ResolveLyricsPath(const std::string& nameUtf8); // nombre o ruta completa
+unsigned long long FileStamp(const std::wstring& path);      // 0 si no existe
+
 // Estado de una instancia (un clip) del plugin.
 // La letra se pasa como texto; cada linea no vacia es un "paso".
 //   indice -1 = no se muestra nada ("linea 0")
@@ -35,6 +43,7 @@ public:
     // solo llegan a clips que se estan reproduciendo (activos).
     void Touch();
     bool IsActive() const;
+    void GetStatus(int& nLines, int& idx);
 
     struct View {
         std::wstring text;

@@ -1,9 +1,13 @@
 // Plugin FFGL "Lyrics OSC" para Resolume Arena
-// Fuente de texto para letras: varias tipografias, lista de estrofas y control por OSC.
+// Letras linea por linea, varias tipografias y control por OSC.
 #include <FFGLSDK.h>
 
+#include <windows.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cwchar>
 #include <mutex>
 #include <string>
@@ -16,6 +20,7 @@ using namespace ffglex;
 
 enum ParamID : FFUInt32 {
     P_TEXT = 0,   // cuadro de texto con la letra (una linea = un paso)
+    P_FILE,       // opcional: nombre de un .txt (se edita en el Bloc de notas)
     P_RESTART,    // boton: vuelve a "nada en pantalla"
     P_PREV,       // boton: linea anterior
     P_NEXT,       // boton: linea siguiente
@@ -29,6 +34,7 @@ enum ParamID : FFUInt32 {
     P_SPACING,
     P_BOLD,
     P_ITALIC,
+    P_HIDESTATUS, // oculta el texto de diagnostico
     P_COUNT
 };
 
@@ -102,14 +108,25 @@ public:
     char* GetTextParameter(unsigned int index) override;
 
 private:
+    void RefreshLyricsLocked(); // requiere fileMu_
+    void CheckFileChanged();
+
     lyr::LyricsState state_;
     std::vector<std::wstring> fonts_;
 
     std::mutex mu_;
     float values_[P_COUNT];
-    bool high_[P_COUNT];
+    ULONGLONG lastFire_[P_COUNT];
+    std::atomic<int> clicks_{0};
+
+    std::mutex fileMu_;
     std::string textUtf8_;
+    std::string fileUtf8_;
     std::string emptyText_;
+    std::wstring filePath_;
+    ULONGLONG fileStamp_ = 0;
+    ULONGLONG lastFileCheck_ = 0;
+    bool fileOk_ = false;
 
     FFGLShader shader_;
     GLuint tex_ = 0;
@@ -117,6 +134,9 @@ private:
     int w_ = 0, h_ = 0;
     RenderKey lastKey_;
     std::vector<unsigned char> pixels_;
+    int glErrLogs_ = 0;
+    bool loggedFirstFrame_ = false;
+    bool loggedFirstDraw_ = false;
 };
 
 static CFFGLPluginInfo PluginInfo(
@@ -134,10 +154,12 @@ LyricsPlugin::LyricsPlugin()
     SetMinInputs(0);
     SetMaxInputs(0);
 
-    for (int i = 0; i < P_COUNT; i++) { values_[i] = 0.0f; high_[i] = false; }
+    for (int i = 0; i < P_COUNT; i++) { values_[i] = 0.0f; lastFire_[i] = 0; }
 
     // Cuadro de texto: aqui se pega la letra de la cancion (una linea = un paso)
     SetParamInfo(P_TEXT, "Lyrics", FF_TYPE_TEXT, (const char*)"");
+    // Alternativa: nombre de un .txt en Documentos\Resolume Arena\Lyrics (se edita en el Bloc de notas)
+    SetParamInfo(P_FILE, "File (optional)", FF_TYPE_TEXT, (const char*)"");
 
     // Botones de pulsar y soltar (trigger)
     SetParamInfof(P_RESTART, "Restart", FF_TYPE_EVENT);
@@ -173,11 +195,15 @@ LyricsPlugin::LyricsPlugin()
     SetParamInfo(P_SPACING, "Line Spacing", FF_TYPE_STANDARD, 0.0f);
     SetParamInfof(P_BOLD, "Bold", FF_TYPE_BOOLEAN);
     SetParamInfof(P_ITALIC, "Italic", FF_TYPE_BOOLEAN);
+    SetParamInfof(P_HIDESTATUS, "Hide Status", FF_TYPE_BOOLEAN);
+
+    lyr::Log("Plugin creado. Fuentes: " + std::to_string(fonts_.size()));
 }
 
 FFResult LyricsPlugin::InitGL(const FFGLViewportStruct* vp)
 {
     if (!shader_.Compile(kVertex, kFragment)) {
+        lyr::Log("ERROR: no compila el shader (InitGL falla)");
         DeInitGL();
         return FF_FAIL;
     }
@@ -195,6 +221,7 @@ FFResult LyricsPlugin::InitGL(const FFGLViewportStruct* vp)
     w_ = (int)vp->width;
     h_ = (int)vp->height;
     lastKey_ = RenderKey();
+    lyr::Log("InitGL ok. Viewport " + std::to_string(w_) + "x" + std::to_string(h_));
     return CFFGLPlugin::InitGL(vp);
 }
 
@@ -210,31 +237,35 @@ FFResult LyricsPlugin::DeInitGL()
 FFResult LyricsPlugin::SetFloatParameter(unsigned int idx, float value)
 {
     if (idx >= P_COUNT) return FF_FAIL;
-    if (idx == P_TEXT) return FF_SUCCESS;
+    if (idx == P_TEXT || idx == P_FILE) return FF_SUCCESS;
+
+    // Botones trigger: Resolume envia 1 al pulsar. Actuamos una vez y devolvemos 0
+    // (como hace el SDK oficial al "consumir" el trigger).
+    if (idx == P_RESTART || idx == P_PREV || idx == P_NEXT) {
+        if (value > 0.5f) {
+            ULONGLONG now = GetTickCount64();
+            if (now - lastFire_[idx] > 80) { // evita dobles disparos en el mismo clic
+                lastFire_[idx] = now;
+                clicks_++;
+                if (idx == P_RESTART) state_.Restart();
+                else if (idx == P_PREV) state_.Prev();
+                else state_.Next();
+                int n = 0, i = 0;
+                state_.GetStatus(n, i);
+                lyr::Log(std::string("Boton ") + (idx == P_RESTART ? "Restart" : idx == P_PREV ? "Prev" : "Next") +
+                         " -> paso " + std::to_string(i) + " de " + std::to_string(n));
+            }
+        }
+        return FF_SUCCESS;
+    }
+
     {
         std::lock_guard<std::mutex> lk(mu_);
         values_[idx] = value;
     }
-    switch (idx) {
-    case P_FONT: {
+    if (idx == P_FONT) {
         int i = (int)std::lround(value);
         if (i >= 0 && i < (int)fonts_.size()) state_.SetFont(fonts_[(size_t)i]);
-        break;
-    }
-    case P_RESTART:
-    case P_PREV:
-    case P_NEXT: {
-        // Trigger: actua una sola vez en el flanco de subida (al pulsar)
-        bool high = value > 0.5f;
-        if (high && !high_[idx]) {
-            if (idx == P_RESTART) state_.Restart();
-            else if (idx == P_PREV) state_.Prev();
-            else state_.Next();
-        }
-        high_[idx] = high;
-        break;
-    }
-    default: break;
     }
     return FF_SUCCESS;
 }
@@ -243,24 +274,62 @@ float LyricsPlugin::GetFloatParameter(unsigned int index)
 {
     if (index >= P_COUNT) return 0.0f;
     std::lock_guard<std::mutex> lk(mu_);
-    return values_[index];
+    return values_[index]; // los triggers siempre valen 0
 }
 
-// Resolume envia el texto en CADA fotograma: solo reaccionamos si cambio.
+// La letra viene del archivo (si hay nombre y existe) o, si no, del cuadro de texto.
+void LyricsPlugin::RefreshLyricsLocked()
+{
+    fileOk_ = false;
+    fileStamp_ = 0;
+    if (!fileUtf8_.empty()) {
+        filePath_ = lyr::ResolveLyricsPath(fileUtf8_);
+        std::wstring content;
+        if (!filePath_.empty() && lyr::ReadTextFile(filePath_, content)) {
+            fileOk_ = true;
+            fileStamp_ = lyr::FileStamp(filePath_);
+            state_.SetLyrics(content);
+            lyr::Log("Letra cargada del archivo: " + lyr::WToUtf8(filePath_));
+            return;
+        }
+        lyr::Log("No se pudo leer el archivo: " + lyr::WToUtf8(filePath_));
+    }
+    state_.SetLyrics(lyr::Utf8ToW(textUtf8_));
+}
+
+void LyricsPlugin::CheckFileChanged()
+{
+    ULONGLONG now = GetTickCount64();
+    if (now - lastFileCheck_ < 1000) return;
+    lastFileCheck_ = now;
+    std::lock_guard<std::mutex> lk(fileMu_);
+    if (fileUtf8_.empty()) return;
+    ULONGLONG st = filePath_.empty() ? 0 : lyr::FileStamp(filePath_);
+    if (st != fileStamp_ || (!fileOk_ && st != 0)) RefreshLyricsLocked();
+}
+
+// Resolume envia los textos en CADA fotograma: solo reaccionamos si cambiaron.
 FFResult LyricsPlugin::SetTextParameter(unsigned int index, const char* value)
 {
-    if (index != P_TEXT) return FF_FAIL;
-    if (!value) return FF_SUCCESS;
-    if (textUtf8_ != value) {
-        textUtf8_ = value;
-        state_.SetLyrics(lyr::Utf8ToW(textUtf8_));
-    }
+    if (index != P_TEXT && index != P_FILE) return FF_FAIL;
+    std::string v = value ? value : "";
+    std::lock_guard<std::mutex> lk(fileMu_);
+    std::string& target = (index == P_TEXT) ? textUtf8_ : fileUtf8_;
+    if (target == v) return FF_SUCCESS;
+    target = v;
+    lyr::Log(std::string(index == P_TEXT ? "Texto de la caja recibido: " : "Nombre de archivo recibido: ") +
+             std::to_string(v.size()) + " bytes");
+    RefreshLyricsLocked();
+    int n = 0, i = 0;
+    state_.GetStatus(n, i);
+    lyr::Log("Lineas detectadas: " + std::to_string(n));
     return FF_SUCCESS;
 }
 
 char* LyricsPlugin::GetTextParameter(unsigned int index)
 {
     if (index == P_TEXT) return const_cast<char*>(textUtf8_.c_str());
+    if (index == P_FILE) return const_cast<char*>(fileUtf8_.c_str());
     return const_cast<char*>(emptyText_.c_str());
 }
 
@@ -272,10 +341,25 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
         for (int i = 0; i < P_COUNT; i++) v[i] = values_[i];
     }
     state_.Touch();
+    CheckFileChanged();
     lyr::LyricsState::View view = state_.GetView();
+
+    if (!loggedFirstFrame_) {
+        loggedFirstFrame_ = true;
+        lyr::Log("Primer fotograma. Viewport " + std::to_string(w_) + "x" + std::to_string(h_) +
+                 ", textura=" + std::to_string(tex_));
+    }
 
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+
+    // Texto de diagnostico cuando no hay nada que mostrar (se oculta con "Hide Status")
+    if (!view.blank && view.text.empty() && v[P_HIDESTATUS] < 0.5f) {
+        int n = 0, i = 0;
+        state_.GetStatus(n, i);
+        view.text = L"[Lyrics OSC] lineas=" + std::to_wstring(n) + L"  paso=" + std::to_wstring(i) +
+                    L"  clics=" + std::to_wstring(clicks_.load()) + (fileOk_ ? L"  (archivo)" : L"  (caja)");
+    }
 
     if (view.blank || view.text.empty() || w_ <= 0 || h_ <= 0 || !tex_) return FF_SUCCESS;
 
@@ -312,11 +396,17 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
         st.align = key.align;
         st.lineSpacing = key.spacing;
         st.vertical = key.vertical;
-        if (render::RenderText(key.text, st, w_, h_, pixels_)) {
+        bool ok = render::RenderText(key.text, st, w_, h_, pixels_);
+        if (ok) {
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_BGRA, GL_UNSIGNED_BYTE,
                          pixels_.data());
             lastKey_ = key;
         }
+        size_t opaque = 0;
+        if (ok) for (size_t p = 3; p < pixels_.size(); p += 4) if (pixels_[p]) opaque++;
+        lyr::Log(std::string("Texto dibujado: '") + lyr::WToUtf8(key.text.substr(0, 40)) + "' fuente=" +
+                 lyr::WToUtf8(key.font) + " ok=" + (ok ? "si" : "NO") + " pixeles_con_texto=" +
+                 std::to_string(opaque));
     }
 
     float r, g, b;
@@ -329,6 +419,15 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
     shader_.Set("color", r, g, b);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR && glErrLogs_ < 5) {
+        glErrLogs_++;
+        lyr::Log("Error OpenGL tras dibujar: 0x" + [&] { char b2[16]; snprintf(b2, sizeof(b2), "%X", (unsigned)err); return std::string(b2); }());
+    } else if (err == GL_NO_ERROR && !loggedFirstDraw_) {
+        loggedFirstDraw_ = true;
+        lyr::Log("Primer dibujo sin errores de OpenGL");
+    }
 
     // Restaurar
     glBindVertexArray((GLuint)prevVao);

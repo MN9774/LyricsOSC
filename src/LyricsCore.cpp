@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -58,6 +59,63 @@ std::wstring LyricsDir()
     std::wstring dir = std::wstring(docs) + L"\\Resolume Arena\\Lyrics";
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     return dir;
+}
+
+void Log(const std::string& msg)
+{
+    static std::mutex m;
+    static int count = 0;
+    std::lock_guard<std::mutex> lk(m);
+    if (count++ > 400) return;
+    static std::wstring path = LyricsDir() + L"\\lyrics_log.txt";
+    std::ofstream f(path, std::ios::app);
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char ts[40];
+    snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d  ", st.wHour, st.wMinute, st.wSecond,
+             st.wMilliseconds);
+    f << ts << msg << "\n";
+}
+
+bool ReadTextFile(const std::wstring& path, std::wstring& out)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::stringstream buf;
+    buf << f.rdbuf();
+    std::string bytes = buf.str();
+    if (bytes.size() >= 3 && (uint8_t)bytes[0] == 0xEF && (uint8_t)bytes[1] == 0xBB &&
+        (uint8_t)bytes[2] == 0xBF)
+        bytes.erase(0, 3);
+    out = Utf8ToW(bytes);
+    return true;
+}
+
+std::wstring ResolveLyricsPath(const std::string& nameUtf8)
+{
+    std::wstring n = Utf8ToW(nameUtf8);
+    size_t a = 0, b = n.size();
+    while (a < b && iswspace(n[a])) a++;
+    while (b > a && iswspace(n[b - 1])) b--;
+    n = n.substr(a, b - a);
+    if (n.size() >= 2 && n.front() == L'"' && n.back() == L'"') n = n.substr(1, n.size() - 2);
+    if (n.empty()) return n;
+    bool absolute = (n.find(L':') != std::wstring::npos) || n.compare(0, 2, L"\\\\") == 0;
+    if (!absolute) n = LyricsDir() + L"\\" + n;
+    size_t sl = n.find_last_of(L"\\/");
+    size_t dot = n.find_last_of(L'.');
+    if (dot == std::wstring::npos || (sl != std::wstring::npos && dot < sl)) n += L".txt";
+    return n;
+}
+
+unsigned long long FileStamp(const std::wstring& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return 0;
+    unsigned long long t = ((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) |
+                           (unsigned long long)d.ftLastWriteTime.dwLowDateTime;
+    return t ^ (((unsigned long long)d.nFileSizeLow) << 7) ^ 1ULL;
 }
 
 static std::wstring Trim(const std::wstring& s)
@@ -357,6 +415,13 @@ void LyricsState::SetFont(const std::wstring& f)
 {
     std::lock_guard<std::mutex> lk(m_);
     if (!f.empty()) font_ = f;
+}
+
+void LyricsState::GetStatus(int& nLines, int& idx)
+{
+    std::lock_guard<std::mutex> lk(m_);
+    nLines = (int)lines_.size();
+    idx = idx_ + 1; // 0 = nada, 1 = primera linea
 }
 
 void LyricsState::Touch() { lastTouch_.store(GetTickCount64()); }

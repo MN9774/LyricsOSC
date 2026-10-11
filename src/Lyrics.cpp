@@ -158,8 +158,8 @@ LyricsPlugin::LyricsPlugin()
 
     // Cuadro de texto: aqui se pega la letra de la cancion (una linea = un paso)
     SetParamInfo(P_TEXT, "Lyrics", FF_TYPE_TEXT, (const char*)"");
-    // Alternativa: nombre de un .txt en Documentos\Resolume Arena\Lyrics (se edita en el Bloc de notas)
-    SetParamInfo(P_FILE, "File (optional)", FF_TYPE_TEXT, (const char*)"");
+    // Alternativa: arrastra un .txt aqui (o haz clic para buscarlo). Se edita en el Bloc de notas.
+    SetFileParamInfo(P_FILE, "Lyrics File", std::vector<std::string>{"txt", ".txt"}, "");
 
     // Botones de pulsar y soltar (trigger)
     SetParamInfof(P_RESTART, "Restart", FF_TYPE_EVENT);
@@ -357,8 +357,10 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
     if (!view.blank && view.text.empty() && v[P_HIDESTATUS] < 0.5f) {
         int n = 0, i = 0;
         state_.GetStatus(n, i);
+        std::wstring fileState = fileUtf8_.empty() ? L"-" : (fileOk_ ? L"OK" : L"NO ENCONTRADO");
         view.text = L"[Lyrics OSC] lineas=" + std::to_wstring(n) + L"  paso=" + std::to_wstring(i) +
-                    L"  clics=" + std::to_wstring(clicks_.load()) + (fileOk_ ? L"  (archivo)" : L"  (caja)");
+                    L"  clics=" + std::to_wstring(clicks_.load()) + L"\ncaja=" +
+                    std::to_wstring(textUtf8_.size()) + L" bytes  archivo=" + fileState;
     }
 
     if (view.blank || view.text.empty() || w_ <= 0 || h_ <= 0 || !tex_) return FF_SUCCESS;

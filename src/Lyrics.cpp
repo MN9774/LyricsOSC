@@ -1,8 +1,11 @@
 // Plugin FFGL "Lyrics OSC" para Resolume Arena
-// Letras linea por linea, tipografias, color, contorno, sombra, animaciones y OSC.
+// Letras linea por linea, tipografias, color, contorno, sombra, glow, blur,
+// animaciones, copiar/pegar ajustes, presets y control por OSC.
 #include <FFGLSDK.h>
 
 #include <windows.h>
+#include <commdlg.h>
+#include <objbase.h>
 
 #include <algorithm>
 #include <atomic>
@@ -10,23 +13,37 @@
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
+#include <fstream>
+#include <locale>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "LyricsCore.h"
 #include "TextRender.h"
 
+#pragma comment(lib, "comdlg32.lib")
+
 using namespace ffglex;
 
+// El orden de este enum es el orden en que aparecen los parametros en Resolume.
 enum ParamID : FFUInt32 {
+    // --- Grupo "Lyrics"
     P_TEXT = 0,   // cuadro de texto con la letra (una linea = un paso)
     P_FILE,       // archivo .txt (arrastrar y soltar)
     P_RESTART,    // boton: vuelve a "nada en pantalla"
     P_PREV,       // boton: linea anterior
     P_NEXT,       // boton: linea siguiente
+    P_HIDESTATUS, // oculta el texto de diagnostico
 
-    P_FONT,
+    // --- Grupo "Text"
+    P_FONT,       // slider: la rueda del raton recorre las tipografias
+    P_FONT_PREV,
+    P_FONT_NEXT,
     P_SIZE,
     P_COLOR_R,    // Color del texto (selector de color: R, G, B consecutivos)
     P_COLOR_G,
@@ -37,33 +54,29 @@ enum ParamID : FFUInt32 {
     P_BOLD,
     P_ITALIC,
 
-    P_OUT_W,      // Contorno: grosor (0 = sin contorno)
-    P_OUT_R,      // Contorno: color
-    P_OUT_G,
-    P_OUT_B,
+    // --- Grupo "Outline"
+    P_OL_COPY, P_OL_PASTE,
+    P_OUT_W, P_OUT_R, P_OUT_G, P_OUT_B,
 
-    P_SH_OP,      // Sombra: opacidad (0 = sin sombra)
-    P_SH_DIST,
-    P_SH_ANGLE,
-    P_SH_BLUR,
-    P_SH_R,       // Sombra: color
-    P_SH_G,
-    P_SH_B,
+    // --- Grupo "Shadow"
+    P_SH_COPY, P_SH_PASTE,
+    P_SH_OP, P_SH_DIST, P_SH_ANGLE, P_SH_BLUR, P_SH_R, P_SH_G, P_SH_B,
 
-    P_GL_INT,     // Glow: intensidad (0 = sin glow)
-    P_GL_BLUR,    // Glow: desenfoque gaussiano
-    P_GL_R,       // Glow: color
-    P_GL_G,
-    P_GL_B,
+    // --- Grupo "Glow"
+    P_GL_COPY, P_GL_PASTE,
+    P_GL_INT, P_GL_BLUR, P_GL_R, P_GL_G, P_GL_B,
 
-    P_ANIM_IN,    // Animacion de entrada de cada linea
-    P_IN_TIME,
-    P_ANIM_OUT,   // Animacion de salida de la linea anterior
-    P_OUT_TIME,
-    P_ANIM_DIST,
-    P_EASE,
+    // --- Grupo "Blur"
+    P_BL_COPY, P_BL_PASTE,
+    P_BLUR_AMT,
 
-    P_HIDESTATUS, // oculta el texto de diagnostico
+    // --- Grupo "Animation"
+    P_AN_COPY, P_AN_PASTE,
+    P_ANIM_IN, P_IN_TIME, P_ANIM_OUT, P_OUT_TIME, P_ANIM_DIST, P_EASE,
+
+    // --- Grupo "Presets"
+    P_COPY_ALL, P_PASTE_ALL, P_SAVE_PRESET, P_LOAD_PRESET, P_PRESET_FILE,
+
     P_COUNT
 };
 
@@ -78,6 +91,142 @@ static const char* kAnimNames[A_COUNT] = {
 
 static const char* kEaseNames[4] = {"Linear", "Ease Out", "Ease In Out", "Back"};
 
+// ---------------------------------------------------------------- grupos copiar/pegar
+enum Group { G_OUTLINE = 0, G_SHADOW, G_GLOW, G_BLUR, G_ANIM, G_ALL, G_COUNT };
+
+static std::vector<int> GroupParams(int g)
+{
+    switch (g) {
+    case G_OUTLINE: return {(int)P_OUT_W, (int)P_OUT_R, (int)P_OUT_G, (int)P_OUT_B};
+    case G_SHADOW:
+        return {(int)P_SH_OP, (int)P_SH_DIST, (int)P_SH_ANGLE, (int)P_SH_BLUR,
+                (int)P_SH_R, (int)P_SH_G, (int)P_SH_B};
+    case G_GLOW:
+        return {(int)P_GL_INT, (int)P_GL_BLUR, (int)P_GL_R, (int)P_GL_G, (int)P_GL_B};
+    case G_BLUR: return {(int)P_BLUR_AMT};
+    case G_ANIM:
+        return {(int)P_ANIM_IN, (int)P_IN_TIME, (int)P_ANIM_OUT, (int)P_OUT_TIME,
+                (int)P_ANIM_DIST, (int)P_EASE};
+    case G_ALL: {
+        // Todo salvo la tipografia y el archivo de la letra
+        std::vector<int> all = {(int)P_SIZE, (int)P_COLOR_R, (int)P_COLOR_G, (int)P_COLOR_B,
+                                (int)P_ALIGN, (int)P_POS, (int)P_SPACING, (int)P_BOLD, (int)P_ITALIC};
+        for (int k = 0; k < G_ALL; k++) {
+            std::vector<int> sub = GroupParams(k);
+            all.insert(all.end(), sub.begin(), sub.end());
+        }
+        return all;
+    }
+    default: return {};
+    }
+}
+
+// Portapapeles compartido por todas las capas/instancias del plugin
+static std::mutex gClipMu;
+static std::map<int, std::vector<std::pair<int, float>>> gClip;
+
+// ---------------------------------------------------------------- presets (archivo)
+struct PresetKey { int id; const char* key; };
+static const PresetKey kPresetKeys[] = {
+    {P_SIZE, "size"}, {P_COLOR_R, "colorR"}, {P_COLOR_G, "colorG"}, {P_COLOR_B, "colorB"},
+    {P_ALIGN, "align"}, {P_POS, "position"}, {P_SPACING, "lineSpacing"}, {P_BOLD, "bold"},
+    {P_ITALIC, "italic"},
+    {P_OUT_W, "outlineWidth"}, {P_OUT_R, "outlineR"}, {P_OUT_G, "outlineG"}, {P_OUT_B, "outlineB"},
+    {P_SH_OP, "shadowOpacity"}, {P_SH_DIST, "shadowDistance"}, {P_SH_ANGLE, "shadowAngle"},
+    {P_SH_BLUR, "shadowBlur"}, {P_SH_R, "shadowR"}, {P_SH_G, "shadowG"}, {P_SH_B, "shadowB"},
+    {P_GL_INT, "glowIntensity"}, {P_GL_BLUR, "glowBlur"}, {P_GL_R, "glowR"}, {P_GL_G, "glowG"},
+    {P_GL_B, "glowB"},
+    {P_BLUR_AMT, "blurAmount"},
+    {P_ANIM_IN, "animIn"}, {P_IN_TIME, "animInTime"}, {P_ANIM_OUT, "animOut"},
+    {P_OUT_TIME, "animOutTime"}, {P_ANIM_DIST, "animDistance"}, {P_EASE, "animEasing"},
+};
+
+struct Async {
+    std::atomic<bool> busy{false};
+    std::atomic<bool> hasLoad{false};
+    std::mutex m;
+    std::wstring loadPath;
+};
+
+static std::mutex gPresetDirMu;
+static std::wstring gPresetDir;
+
+static std::wstring PresetStartDir()
+{
+    std::lock_guard<std::mutex> lk(gPresetDirMu);
+    if (gPresetDir.empty()) {
+        gPresetDir = lyr::LyricsDir() + L"\\Presets";
+        CreateDirectoryW(gPresetDir.c_str(), nullptr);
+    }
+    return gPresetDir;
+}
+
+static void RememberPresetDir(const std::wstring& filePath)
+{
+    size_t sl = filePath.find_last_of(L"\\/");
+    if (sl == std::wstring::npos) return;
+    std::lock_guard<std::mutex> lk(gPresetDirMu);
+    gPresetDir = filePath.substr(0, sl);
+}
+
+// Los cuadros de dialogo de Windows se abren en un hilo aparte para no bloquear a Resolume.
+static void SaveDialogThread(std::shared_ptr<Async> a, std::string content, HWND owner)
+{
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    wchar_t file[MAX_PATH] = L"LyricsStyle.lyrpreset";
+    std::wstring dir = PresetStartDir();
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Lyrics OSC preset (*.lyrpreset)\0*.lyrpreset\0All files (*.*)\0*.*\0";
+    ofn.lpstrDefExt = L"lyrpreset";
+    ofn.lpstrInitialDir = dir.c_str();
+    ofn.lpstrTitle = L"Save Lyrics OSC preset";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    if (GetSaveFileNameW(&ofn)) {
+        std::ofstream f(std::wstring(file), std::ios::binary);
+        if (f) {
+            f << content;
+            f.close();
+            RememberPresetDir(file);
+            lyr::Log("Preset guardado: " + lyr::WToUtf8(file));
+        } else {
+            lyr::Log("ERROR: no se pudo escribir el preset: " + lyr::WToUtf8(file));
+        }
+    }
+    CoUninitialize();
+    a->busy.store(false);
+}
+
+static void OpenDialogThread(std::shared_ptr<Async> a, HWND owner)
+{
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    wchar_t file[MAX_PATH] = {0};
+    std::wstring dir = PresetStartDir();
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Lyrics OSC preset (*.lyrpreset)\0*.lyrpreset\0All files (*.*)\0*.*\0";
+    ofn.lpstrInitialDir = dir.c_str();
+    ofn.lpstrTitle = L"Load Lyrics OSC preset";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&ofn)) {
+        RememberPresetDir(file);
+        std::lock_guard<std::mutex> lk(a->m);
+        a->loadPath = file;
+        a->hasLoad.store(true);
+    }
+    CoUninitialize();
+    a->busy.store(false);
+}
+
+// ---------------------------------------------------------------- shaders
 static const char* kVertex = R"GLSL(#version 410 core
 out vec2 uv;
 void main()
@@ -228,6 +377,7 @@ public:
     float GetFloatParameter(unsigned int index) override;
     FFResult SetTextParameter(unsigned int index, const char* value) override;
     char* GetTextParameter(unsigned int index) override;
+    char* GetParameterDisplay(unsigned int index) override;
 
 private:
     void RefreshLyricsLocked(); // requiere fileMu_
@@ -236,6 +386,17 @@ private:
     void StartTransition(const float* v);
     void DrawLayer(const Layer& L, int kind, bool isIn, float e);
 
+    // --- tipografia, copiar/pegar y presets
+    int FontIndexFromValue(float v) const;
+    float FontValueFromIndex(int i) const;
+    void PushValue(unsigned int id, float v); // cambia un valor y avisa a Resolume
+    void OnTrigger(unsigned int idx);
+    void CopyGroup(int g);
+    void PasteGroup(int g);
+    std::string BuildPresetText();
+    bool LoadPresetFile(const std::wstring& path);
+    void FlushAsync();
+
     lyr::LyricsState state_;
     std::vector<std::wstring> fonts_;
 
@@ -243,15 +404,20 @@ private:
     float values_[P_COUNT];
     ULONGLONG lastFire_[P_COUNT];
     std::atomic<int> clicks_{0};
+    ULONGLONG createdTick_ = 0;
 
     std::mutex fileMu_;
     std::string textUtf8_;
     std::string fileUtf8_;
+    std::string presetFileUtf8_;
     std::string emptyText_;
     std::wstring filePath_;
     ULONGLONG fileStamp_ = 0;
     ULONGLONG lastFileCheck_ = 0;
     bool fileOk_ = false;
+
+    std::shared_ptr<Async> async_ = std::make_shared<Async>();
+    char dispBuf_[200];
 
     FFGLShader shader_;
     GLuint vao_ = 0;
@@ -265,6 +431,7 @@ private:
     bool outActive_ = false;
     int tIn_ = 0, tOut_ = 0, tEase_ = 1;
     float tInDur_ = 0.0f, tOutDur_ = 0.0f, tDist_ = 0.0f;
+    float staticBlurU_ = 0.0f;
 
     int glErrLogs_ = 0;
     bool loggedFirstFrame_ = false;
@@ -279,41 +446,67 @@ static CFFGLPluginInfo PluginInfo(
     2, 1,
     1, 0,
     FF_SOURCE,
-    "Letras linea por linea con tipografias, contorno, sombra, animaciones y OSC",
+    "Letras linea por linea con tipografias, efectos, animaciones y OSC",
     "Lyrics OSC");
+
+static bool IsTriggerParam(unsigned int id)
+{
+    switch (id) {
+    case P_RESTART: case P_PREV: case P_NEXT:
+    case P_FONT_PREV: case P_FONT_NEXT:
+    case P_OL_COPY: case P_OL_PASTE: case P_SH_COPY: case P_SH_PASTE:
+    case P_GL_COPY: case P_GL_PASTE: case P_BL_COPY: case P_BL_PASTE:
+    case P_AN_COPY: case P_AN_PASTE:
+    case P_COPY_ALL: case P_PASTE_ALL: case P_SAVE_PRESET: case P_LOAD_PRESET:
+        return true;
+    default: return false;
+    }
+}
 
 LyricsPlugin::LyricsPlugin()
 {
     SetMinInputs(0);
     SetMaxInputs(0);
 
+    createdTick_ = GetTickCount64();
+    dispBuf_[0] = 0;
     for (int i = 0; i < P_COUNT; i++) { values_[i] = 0.0f; lastFire_[i] = 0; }
 
-    // --- Letra
+    // Ayudantes para declarar parametros
+    auto button = [&](unsigned int id, const char* uniqueName, const char* shownName) {
+        SetParamInfof(id, uniqueName, FF_TYPE_EVENT);
+        if (shownName) SetParamDisplayName(id, std::string(shownName), false);
+    };
+    auto group = [&](std::initializer_list<unsigned int> ids, const char* name) {
+        for (unsigned int id : ids) SetParamGroup(id, std::string(name));
+    };
+
+    // =============== Grupo "Lyrics"
     SetParamInfo(P_TEXT, "Lyrics", FF_TYPE_TEXT, (const char*)"");
     SetFileParamInfo(P_FILE, "Lyrics File", std::vector<std::string>{"txt", ".txt"}, "");
+    button(P_RESTART, "Restart", nullptr);
+    button(P_PREV, "Prev", nullptr);
+    button(P_NEXT, "Next", nullptr);
+    SetParamInfof(P_HIDESTATUS, "Hide Status", FF_TYPE_BOOLEAN);
+    group({P_TEXT, P_FILE, P_RESTART, P_PREV, P_NEXT, P_HIDESTATUS}, "Lyrics");
 
-    // --- Botones de pulsar y soltar (trigger)
-    SetParamInfof(P_RESTART, "Restart", FF_TYPE_EVENT);
-    SetParamInfof(P_PREV, "Prev", FF_TYPE_EVENT);
-    SetParamInfof(P_NEXT, "Next", FF_TYPE_EVENT);
-
-    // --- Tipografia: todas las fuentes instaladas en Windows
+    // =============== Grupo "Text"
     fonts_ = render::InstalledFonts();
-    if (fonts_.size() > 500) fonts_.resize(500);
+    if (fonts_.size() > 1000) fonts_.resize(1000);
     int defFont = 0;
     for (size_t i = 0; i < fonts_.size(); i++)
         if (_wcsicmp(fonts_[i].c_str(), L"Arial") == 0) { defFont = (int)i; break; }
-    values_[P_FONT] = (float)defFont;
+    values_[P_FONT] = FontValueFromIndex(defFont);
     state_.SetFont(fonts_[(size_t)defFont]);
-    SetOptionParamInfo(P_FONT, "Font", (unsigned int)fonts_.size(), (float)defFont);
-    for (size_t i = 0; i < fonts_.size(); i++)
-        SetParamElementInfo(P_FONT, (unsigned int)i, lyr::WToUtf8(fonts_[i]).c_str(), (float)i);
+    // Slider normalizado: arrastra o usa la rueda del raton; la barra muestra el nombre de la fuente.
+    SetParamInfof(P_FONT, "Font Select", FF_TYPE_STANDARD);
+    SetParamDisplayName(P_FONT, std::string("Font"), false);
+    button(P_FONT_PREV, "Font Prev", "Font -");
+    button(P_FONT_NEXT, "Font Next", "Font +");
 
     values_[P_SIZE] = 0.3f;
     SetParamInfo(P_SIZE, "Size", FF_TYPE_STANDARD, 0.3f);
 
-    // --- Color del texto (selector de color)
     values_[P_COLOR_R] = values_[P_COLOR_G] = values_[P_COLOR_B] = 1.0f;
     SetParamInfo(P_COLOR_R, "Text Color", FF_TYPE_RED, 1.0f);
     SetParamInfo(P_COLOR_G, "Text Color G", FF_TYPE_GREEN, 1.0f);
@@ -330,17 +523,24 @@ LyricsPlugin::LyricsPlugin()
     SetParamInfo(P_SPACING, "Line Spacing", FF_TYPE_STANDARD, 0.0f);
     SetParamInfof(P_BOLD, "Bold", FF_TYPE_BOOLEAN);
     SetParamInfof(P_ITALIC, "Italic", FF_TYPE_BOOLEAN);
+    group({P_FONT, P_FONT_PREV, P_FONT_NEXT, P_SIZE, P_COLOR_R, P_COLOR_G, P_COLOR_B, P_ALIGN,
+           P_POS, P_SPACING, P_BOLD, P_ITALIC}, "Text");
 
-    // --- Contorno
+    // =============== Grupo "Outline"
+    button(P_OL_COPY, "Outline Copy", "Copy");
+    button(P_OL_PASTE, "Outline Paste", "Paste");
     SetParamInfo(P_OUT_W, "Outline Width", FF_TYPE_STANDARD, 0.0f);
     SetParamInfo(P_OUT_R, "Outline Color", FF_TYPE_RED, 0.0f);
     SetParamInfo(P_OUT_G, "Outline Color G", FF_TYPE_GREEN, 0.0f);
     SetParamInfo(P_OUT_B, "Outline Color B", FF_TYPE_BLUE, 0.0f);
+    group({P_OL_COPY, P_OL_PASTE, P_OUT_W, P_OUT_R, P_OUT_G, P_OUT_B}, "Outline");
 
-    // --- Sombra
+    // =============== Grupo "Shadow"
     values_[P_SH_DIST] = 0.3f;
     values_[P_SH_ANGLE] = 0.875f; // 315 grados: abajo a la derecha
     values_[P_SH_BLUR] = 0.3f;
+    button(P_SH_COPY, "Shadow Copy", "Copy");
+    button(P_SH_PASTE, "Shadow Paste", "Paste");
     SetParamInfo(P_SH_OP, "Shadow Opacity", FF_TYPE_STANDARD, 0.0f);
     SetParamInfo(P_SH_DIST, "Shadow Distance", FF_TYPE_STANDARD, 0.3f);
     SetParamInfo(P_SH_ANGLE, "Shadow Angle", FF_TYPE_STANDARD, 0.875f);
@@ -348,37 +548,77 @@ LyricsPlugin::LyricsPlugin()
     SetParamInfo(P_SH_R, "Shadow Color", FF_TYPE_RED, 0.0f);
     SetParamInfo(P_SH_G, "Shadow Color G", FF_TYPE_GREEN, 0.0f);
     SetParamInfo(P_SH_B, "Shadow Color B", FF_TYPE_BLUE, 0.0f);
+    group({P_SH_COPY, P_SH_PASTE, P_SH_OP, P_SH_DIST, P_SH_ANGLE, P_SH_BLUR, P_SH_R, P_SH_G, P_SH_B},
+          "Shadow");
 
-    // --- Glow (resplandor)
+    // =============== Grupo "Glow"
     values_[P_GL_BLUR] = 0.4f;
     values_[P_GL_G] = 0.8f;
     values_[P_GL_B] = 1.0f;
+    button(P_GL_COPY, "Glow Copy", "Copy");
+    button(P_GL_PASTE, "Glow Paste", "Paste");
     SetParamInfo(P_GL_INT, "Glow Intensity", FF_TYPE_STANDARD, 0.0f);
     SetParamInfo(P_GL_BLUR, "Glow Blur", FF_TYPE_STANDARD, 0.4f);
     SetParamInfo(P_GL_R, "Glow Color", FF_TYPE_RED, 0.0f);
     SetParamInfo(P_GL_G, "Glow Color G", FF_TYPE_GREEN, 0.8f);
     SetParamInfo(P_GL_B, "Glow Color B", FF_TYPE_BLUE, 1.0f);
+    group({P_GL_COPY, P_GL_PASTE, P_GL_INT, P_GL_BLUR, P_GL_R, P_GL_G, P_GL_B}, "Glow");
 
-    // --- Animaciones (se repiten en cada cambio de linea)
-    SetOptionParamInfo(P_ANIM_IN, "Animation In", (unsigned int)A_COUNT, 0.0f);
-    SetOptionParamInfo(P_ANIM_OUT, "Animation Out", (unsigned int)A_COUNT, 0.0f);
-    for (int i = 0; i < A_COUNT; i++) {
-        SetParamElementInfo(P_ANIM_IN, (unsigned int)i, kAnimNames[i], (float)i);
-        SetParamElementInfo(P_ANIM_OUT, (unsigned int)i, kAnimNames[i], (float)i);
-    }
+    // =============== Grupo "Blur" (desenfoque fijo de todo el texto)
+    button(P_BL_COPY, "Blur Copy", "Copy");
+    button(P_BL_PASTE, "Blur Paste", "Paste");
+    SetParamInfo(P_BLUR_AMT, "Blur Amount", FF_TYPE_STANDARD, 0.0f);
+    group({P_BL_COPY, P_BL_PASTE, P_BLUR_AMT}, "Blur");
+
+    // =============== Grupo "Animation" (se repite en cada cambio de linea)
     values_[P_IN_TIME] = 0.15f;
     values_[P_OUT_TIME] = 0.15f;
     values_[P_ANIM_DIST] = 0.4f;
     values_[P_EASE] = 1.0f;
+    button(P_AN_COPY, "Animation Copy", "Copy");
+    button(P_AN_PASTE, "Animation Paste", "Paste");
+    SetOptionParamInfo(P_ANIM_IN, "Animation In", (unsigned int)A_COUNT, 0.0f);
+    for (int i = 0; i < A_COUNT; i++)
+        SetParamElementInfo(P_ANIM_IN, (unsigned int)i, kAnimNames[i], (float)i);
     SetParamInfo(P_IN_TIME, "Anim In Time", FF_TYPE_STANDARD, 0.15f);
+    SetOptionParamInfo(P_ANIM_OUT, "Animation Out", (unsigned int)A_COUNT, 0.0f);
+    for (int i = 0; i < A_COUNT; i++)
+        SetParamElementInfo(P_ANIM_OUT, (unsigned int)i, kAnimNames[i], (float)i);
     SetParamInfo(P_OUT_TIME, "Anim Out Time", FF_TYPE_STANDARD, 0.15f);
     SetParamInfo(P_ANIM_DIST, "Anim Distance", FF_TYPE_STANDARD, 0.4f);
     SetOptionParamInfo(P_EASE, "Anim Easing", 4, 1.0f);
     for (int i = 0; i < 4; i++) SetParamElementInfo(P_EASE, (unsigned int)i, kEaseNames[i], (float)i);
+    group({P_AN_COPY, P_AN_PASTE, P_ANIM_IN, P_IN_TIME, P_ANIM_OUT, P_OUT_TIME, P_ANIM_DIST, P_EASE},
+          "Animation");
 
-    SetParamInfof(P_HIDESTATUS, "Hide Status", FF_TYPE_BOOLEAN);
+    // =============== Grupo "Presets"
+    button(P_COPY_ALL, "Copy All", nullptr);
+    button(P_PASTE_ALL, "Paste All", nullptr);
+    button(P_SAVE_PRESET, "Save Preset", nullptr);
+    button(P_LOAD_PRESET, "Load Preset", nullptr);
+    SetFileParamInfo(P_PRESET_FILE, "Preset File", std::vector<std::string>{"lyrpreset", ".lyrpreset"}, "");
+    group({P_COPY_ALL, P_PASTE_ALL, P_SAVE_PRESET, P_LOAD_PRESET, P_PRESET_FILE}, "Presets");
 
     lyr::Log("Plugin creado. Fuentes: " + std::to_string(fonts_.size()));
+}
+
+int LyricsPlugin::FontIndexFromValue(float v) const
+{
+    const int n = (int)fonts_.size();
+    if (n <= 1) return 0;
+    int i = (int)std::lround(Clamp01(v) * (float)(n - 1));
+    if (i < 0) i = 0;
+    if (i > n - 1) i = n - 1;
+    return i;
+}
+
+float LyricsPlugin::FontValueFromIndex(int i) const
+{
+    const int n = (int)fonts_.size();
+    if (n <= 1) return 0.0f;
+    if (i < 0) i = 0;
+    if (i > n - 1) i = n - 1;
+    return (float)i / (float)(n - 1);
 }
 
 void LyricsPlugin::MakeTexture(GLuint& t)
@@ -426,25 +666,194 @@ FFResult LyricsPlugin::DeInitGL()
     return FF_SUCCESS;
 }
 
+// ---------------------------------------------------------------- valores, copiar/pegar, presets
+// Cambia un valor desde el propio plugin y avisa a Resolume para que mueva el control en pantalla.
+void LyricsPlugin::PushValue(unsigned int id, float v)
+{
+    if (id >= P_COUNT) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        values_[id] = v;
+    }
+    if (id == P_FONT) {
+        int i = FontIndexFromValue(v);
+        if (i >= 0 && i < (int)fonts_.size()) state_.SetFont(fonts_[(size_t)i]);
+    }
+    RaiseParamEvent(id, FF_EVENT_FLAG_VALUE);
+}
+
+void LyricsPlugin::CopyGroup(int g)
+{
+    std::vector<int> ids = GroupParams(g);
+    std::vector<std::pair<int, float>> snap;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int id : ids) snap.push_back({id, values_[id]});
+    }
+    {
+        std::lock_guard<std::mutex> lk(gClipMu);
+        gClip[g] = snap;
+    }
+    lyr::Log("Copiado grupo " + std::to_string(g) + " (" + std::to_string(snap.size()) + " valores)");
+}
+
+void LyricsPlugin::PasteGroup(int g)
+{
+    std::vector<std::pair<int, float>> snap;
+    {
+        std::lock_guard<std::mutex> lk(gClipMu);
+        auto it = gClip.find(g);
+        if (it != gClip.end()) snap = it->second;
+    }
+    if (snap.empty()) {
+        lyr::Log("Pegar grupo " + std::to_string(g) + ": no hay nada copiado");
+        return;
+    }
+    for (auto& kv : snap) PushValue((unsigned int)kv.first, kv.second);
+    lyr::Log("Pegado grupo " + std::to_string(g));
+}
+
+std::string LyricsPlugin::BuildPresetText()
+{
+    std::ostringstream os;
+    os.imbue(std::locale::classic());
+    os << "# Lyrics OSC preset\nversion=1\n";
+    int fi = 0;
+    float vals[P_COUNT];
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int i = 0; i < P_COUNT; i++) vals[i] = values_[i];
+    }
+    fi = FontIndexFromValue(vals[P_FONT]);
+    if (fi >= 0 && fi < (int)fonts_.size()) os << "font=" << lyr::WToUtf8(fonts_[(size_t)fi]) << "\n";
+    for (const PresetKey& k : kPresetKeys) os << k.key << "=" << vals[k.id] << "\n";
+    return os.str();
+}
+
+bool LyricsPlugin::LoadPresetFile(const std::wstring& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        lyr::Log("No se pudo leer el preset: " + lyr::WToUtf8(path));
+        return false;
+    }
+    std::stringstream buf;
+    buf << f.rdbuf();
+    std::string text = buf.str();
+    if (text.size() >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB &&
+        (unsigned char)text[2] == 0xBF)
+        text.erase(0, 3);
+
+    int applied = 0;
+    std::istringstream is(text);
+    std::string line;
+    while (std::getline(is, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "font") {
+            std::wstring want = lyr::Utf8ToW(val);
+            for (size_t i = 0; i < fonts_.size(); i++) {
+                if (_wcsicmp(fonts_[i].c_str(), want.c_str()) == 0) {
+                    PushValue(P_FONT, FontValueFromIndex((int)i));
+                    applied++;
+                    break;
+                }
+            }
+            continue;
+        }
+        for (const PresetKey& k : kPresetKeys) {
+            if (key == k.key) {
+                std::istringstream vs(val);
+                vs.imbue(std::locale::classic());
+                float fv = 0.0f;
+                if (vs >> fv) { PushValue((unsigned int)k.id, fv); applied++; }
+                break;
+            }
+        }
+    }
+    lyr::Log("Preset cargado (" + std::to_string(applied) + " valores): " + lyr::WToUtf8(path));
+    return applied > 0;
+}
+
+// Resultado de un cuadro de dialogo (que corre en otro hilo): se aplica desde un hilo de Resolume.
+void LyricsPlugin::FlushAsync()
+{
+    if (!async_->hasLoad.load()) return;
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> lk(async_->m);
+        if (!async_->hasLoad.exchange(false)) return;
+        path = async_->loadPath;
+    }
+    LoadPresetFile(path);
+}
+
+void LyricsPlugin::OnTrigger(unsigned int idx)
+{
+    switch (idx) {
+    case P_RESTART: state_.Restart(); break;
+    case P_PREV: state_.Prev(); break;
+    case P_NEXT: state_.Next(); break;
+    case P_FONT_PREV:
+    case P_FONT_NEXT: {
+        float cur;
+        { std::lock_guard<std::mutex> lk(mu_); cur = values_[P_FONT]; }
+        int i = FontIndexFromValue(cur) + (idx == P_FONT_NEXT ? 1 : -1);
+        if (i < 0) i = 0;
+        if (i > (int)fonts_.size() - 1) i = (int)fonts_.size() - 1;
+        PushValue(P_FONT, FontValueFromIndex(i));
+        break;
+    }
+    case P_OL_COPY: CopyGroup(G_OUTLINE); break;
+    case P_OL_PASTE: PasteGroup(G_OUTLINE); break;
+    case P_SH_COPY: CopyGroup(G_SHADOW); break;
+    case P_SH_PASTE: PasteGroup(G_SHADOW); break;
+    case P_GL_COPY: CopyGroup(G_GLOW); break;
+    case P_GL_PASTE: PasteGroup(G_GLOW); break;
+    case P_BL_COPY: CopyGroup(G_BLUR); break;
+    case P_BL_PASTE: PasteGroup(G_BLUR); break;
+    case P_AN_COPY: CopyGroup(G_ANIM); break;
+    case P_AN_PASTE: PasteGroup(G_ANIM); break;
+    case P_COPY_ALL: CopyGroup(G_ALL); break;
+    case P_PASTE_ALL: PasteGroup(G_ALL); break;
+    case P_SAVE_PRESET:
+        if (!async_->busy.exchange(true)) {
+            std::thread(SaveDialogThread, async_, BuildPresetText(), GetForegroundWindow()).detach();
+        }
+        break;
+    case P_LOAD_PRESET:
+        if (!async_->busy.exchange(true)) {
+            std::thread(OpenDialogThread, async_, GetForegroundWindow()).detach();
+        }
+        break;
+    default: break;
+    }
+}
+
 FFResult LyricsPlugin::SetFloatParameter(unsigned int idx, float value)
 {
+    FlushAsync();
     if (idx >= P_COUNT) return FF_FAIL;
-    if (idx == P_TEXT || idx == P_FILE) return FF_SUCCESS;
+    if (idx == P_TEXT || idx == P_FILE || idx == P_PRESET_FILE) return FF_SUCCESS;
 
     // Botones trigger: Resolume envia 1 al pulsar. Actuamos una vez y devolvemos 0
-    if (idx == P_RESTART || idx == P_PREV || idx == P_NEXT) {
+    if (IsTriggerParam(idx)) {
         if (value > 0.5f) {
             ULONGLONG now = GetTickCount64();
             if (now - lastFire_[idx] > 80) { // evita dobles disparos en el mismo clic
                 lastFire_[idx] = now;
                 clicks_++;
-                if (idx == P_RESTART) state_.Restart();
-                else if (idx == P_PREV) state_.Prev();
-                else state_.Next();
-                int n = 0, i = 0;
-                state_.GetStatus(n, i);
-                lyr::Log(std::string("Boton ") + (idx == P_RESTART ? "Restart" : idx == P_PREV ? "Prev" : "Next") +
-                         " -> paso " + std::to_string(i) + " de " + std::to_string(n));
+                OnTrigger(idx);
+                if (idx == P_RESTART || idx == P_PREV || idx == P_NEXT) {
+                    int n = 0, i = 0;
+                    state_.GetStatus(n, i);
+                    lyr::Log(std::string("Boton ") + (idx == P_RESTART ? "Restart" : idx == P_PREV ? "Prev" : "Next") +
+                             " -> paso " + std::to_string(i) + " de " + std::to_string(n));
+                }
             }
         }
         return FF_SUCCESS;
@@ -455,7 +864,7 @@ FFResult LyricsPlugin::SetFloatParameter(unsigned int idx, float value)
         values_[idx] = value;
     }
     if (idx == P_FONT) {
-        int i = (int)std::lround(value);
+        int i = FontIndexFromValue(value);
         if (i >= 0 && i < (int)fonts_.size()) state_.SetFont(fonts_[(size_t)i]);
     }
     return FF_SUCCESS;
@@ -466,6 +875,33 @@ float LyricsPlugin::GetFloatParameter(unsigned int index)
     if (index >= P_COUNT) return 0.0f;
     std::lock_guard<std::mutex> lk(mu_);
     return values_[index]; // los triggers siempre valen 0
+}
+
+// Texto que Resolume muestra dentro de las barras de los parametros
+char* LyricsPlugin::GetParameterDisplay(unsigned int index)
+{
+    FlushAsync();
+    if (index == P_FONT) {
+        float v;
+        { std::lock_guard<std::mutex> lk(mu_); v = values_[P_FONT]; }
+        int i = FontIndexFromValue(v);
+        std::string name = (i >= 0 && i < (int)fonts_.size()) ? lyr::WToUtf8(fonts_[(size_t)i]) : "-";
+        snprintf(dispBuf_, sizeof(dispBuf_), "%s", name.c_str());
+        return dispBuf_;
+    }
+    if (index == P_SH_ANGLE) {
+        float v;
+        { std::lock_guard<std::mutex> lk(mu_); v = values_[P_SH_ANGLE]; }
+        snprintf(dispBuf_, sizeof(dispBuf_), "%d deg", (int)std::lround(v * 360.0f));
+        return dispBuf_;
+    }
+    if (index == P_IN_TIME || index == P_OUT_TIME) {
+        float v;
+        { std::lock_guard<std::mutex> lk(mu_); v = values_[index]; }
+        snprintf(dispBuf_, sizeof(dispBuf_), "%.2f s", v * 2.0f);
+        return dispBuf_;
+    }
+    return CFFGLPlugin::GetParameterDisplay(index);
 }
 
 // La letra viene del archivo (si hay y existe) o, si no, del cuadro de texto.
@@ -502,8 +938,23 @@ void LyricsPlugin::CheckFileChanged()
 // Resolume envia los textos en CADA fotograma: solo reaccionamos si cambiaron.
 FFResult LyricsPlugin::SetTextParameter(unsigned int index, const char* value)
 {
-    if (index != P_TEXT && index != P_FILE) return FF_FAIL;
+    FlushAsync();
+    if (index != P_TEXT && index != P_FILE && index != P_PRESET_FILE) return FF_FAIL;
     std::string v = value ? value : "";
+
+    if (index == P_PRESET_FILE) {
+        bool load = false;
+        {
+            std::lock_guard<std::mutex> lk(fileMu_);
+            if (presetFileUtf8_ == v) return FF_SUCCESS;
+            presetFileUtf8_ = v;
+            // Los primeros segundos son la restauracion del proyecto: no re-aplicar el preset
+            load = !v.empty() && (GetTickCount64() - createdTick_ > 2500);
+        }
+        if (load) LoadPresetFile(lyr::Utf8ToW(v));
+        return FF_SUCCESS;
+    }
+
     std::lock_guard<std::mutex> lk(fileMu_);
     std::string& target = (index == P_TEXT) ? textUtf8_ : fileUtf8_;
     if (target == v) return FF_SUCCESS;
@@ -521,6 +972,7 @@ char* LyricsPlugin::GetTextParameter(unsigned int index)
 {
     if (index == P_TEXT) return const_cast<char*>(textUtf8_.c_str());
     if (index == P_FILE) return const_cast<char*>(fileUtf8_.c_str());
+    if (index == P_PRESET_FILE) return const_cast<char*>(presetFileUtf8_.c_str());
     return const_cast<char*>(emptyText_.c_str());
 }
 
@@ -577,9 +1029,7 @@ void LyricsPlugin::DrawLayer(const Layer& L, int kind, bool isIn, float e)
         // Maquina de escribir: aparecen letra a letra (al salir se borran desde el final)
         const int n = L.charU.size() > 1 ? (int)L.charU.size() - 1 : 0;
         if (n == 0) {
-            // texto de varias lineas: barrido simple
-            if (isIn) { lo = L.bx0; hi = L.bx0 + e * bw; }
-            else { lo = L.bx0; hi = L.bx0 + e * bw; }
+            lo = L.bx0; hi = L.bx0 + e * bw; // texto de varias lineas: barrido simple
         } else {
             int c = (int)std::floor(e * (float)n + 0.0001f);
             if (c < 0) c = 0;
@@ -593,6 +1043,7 @@ void LyricsPlugin::DrawLayer(const Layer& L, int kind, bool isIn, float e)
     }
     op = Clamp01(op);
     if (sc < 0.05f) sc = 0.05f;
+    blur += staticBlurU_; // desenfoque fijo del grupo "Blur"
 
     glBindTexture(GL_TEXTURE_2D, L.tex);
     shader_.Set("uA", ox, oy, sc);
@@ -604,6 +1055,7 @@ void LyricsPlugin::DrawLayer(const Layer& L, int kind, bool isIn, float e)
 
 FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
 {
+    FlushAsync();
     float v[P_COUNT];
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -629,6 +1081,7 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
         lastSerial_ = view.serial;
         StartTransition(v);
     }
+    staticBlurU_ = v[P_BLUR_AMT] * 0.02f;
 
     // Texto de diagnostico SOLO cuando no hay ninguna letra cargada ("Hide Status" lo oculta)
     if (!view.blank && view.text.empty() && v[P_HIDESTATUS] < 0.5f) {

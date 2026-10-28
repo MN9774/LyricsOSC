@@ -20,6 +20,12 @@ bool ReadTextFile(const std::wstring& path, std::wstring& out);
 std::wstring ResolveLyricsPath(const std::string& nameUtf8); // nombre o ruta completa
 unsigned long long FileStamp(const std::wstring& path);      // 0 si no existe
 
+// Cuadros de dialogo de Windows (se llaman desde un hilo aparte). 'owner' es un HWND.
+void* ForegroundWindowHandle();
+bool PickSavePath(void* owner, const std::wstring& startDir, const std::wstring& defaultName,
+                  std::wstring& outPath);
+bool PickOpenPath(void* owner, const std::wstring& startDir, std::wstring& outPath);
+
 // Estado de una instancia (un clip) del plugin.
 // La letra se pasa como texto; cada linea no vacia es un "paso".
 //   indice -1 = no se muestra nada ("linea 0")

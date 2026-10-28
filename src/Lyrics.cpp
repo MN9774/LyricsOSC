@@ -4,8 +4,6 @@
 #include <FFGLSDK.h>
 
 #include <windows.h>
-#include <commdlg.h>
-#include <objbase.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,8 +23,6 @@
 
 #include "LyricsCore.h"
 #include "TextRender.h"
-
-#pragma comment(lib, "comdlg32.lib")
 
 using namespace ffglex;
 
@@ -170,59 +166,32 @@ static void RememberPresetDir(const std::wstring& filePath)
 }
 
 // Los cuadros de dialogo de Windows se abren en un hilo aparte para no bloquear a Resolume.
-static void SaveDialogThread(std::shared_ptr<Async> a, std::string content, HWND owner)
+static void SaveDialogThread(std::shared_ptr<Async> a, std::string content, void* owner)
 {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    wchar_t file[MAX_PATH] = L"LyricsStyle.lyrpreset";
-    std::wstring dir = PresetStartDir();
-    OPENFILENAMEW ofn;
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = owner;
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"Lyrics OSC preset (*.lyrpreset)\0*.lyrpreset\0All files (*.*)\0*.*\0";
-    ofn.lpstrDefExt = L"lyrpreset";
-    ofn.lpstrInitialDir = dir.c_str();
-    ofn.lpstrTitle = L"Save Lyrics OSC preset";
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
-    if (GetSaveFileNameW(&ofn)) {
-        std::ofstream f(std::wstring(file), std::ios::binary);
+    std::wstring path;
+    if (lyr::PickSavePath(owner, PresetStartDir(), L"LyricsStyle.lyrpreset", path)) {
+        std::ofstream f(path, std::ios::binary);
         if (f) {
             f << content;
             f.close();
-            RememberPresetDir(file);
-            lyr::Log("Preset guardado: " + lyr::WToUtf8(file));
+            RememberPresetDir(path);
+            lyr::Log("Preset guardado: " + lyr::WToUtf8(path));
         } else {
-            lyr::Log("ERROR: no se pudo escribir el preset: " + lyr::WToUtf8(file));
+            lyr::Log("ERROR: no se pudo escribir el preset: " + lyr::WToUtf8(path));
         }
     }
-    CoUninitialize();
     a->busy.store(false);
 }
 
-static void OpenDialogThread(std::shared_ptr<Async> a, HWND owner)
+static void OpenDialogThread(std::shared_ptr<Async> a, void* owner)
 {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    wchar_t file[MAX_PATH] = {0};
-    std::wstring dir = PresetStartDir();
-    OPENFILENAMEW ofn;
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = owner;
-    ofn.lpstrFile = file;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"Lyrics OSC preset (*.lyrpreset)\0*.lyrpreset\0All files (*.*)\0*.*\0";
-    ofn.lpstrInitialDir = dir.c_str();
-    ofn.lpstrTitle = L"Load Lyrics OSC preset";
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&ofn)) {
-        RememberPresetDir(file);
+    std::wstring path;
+    if (lyr::PickOpenPath(owner, PresetStartDir(), path)) {
+        RememberPresetDir(path);
         std::lock_guard<std::mutex> lk(a->m);
-        a->loadPath = file;
+        a->loadPath = path;
         a->hasLoad.store(true);
     }
-    CoUninitialize();
     a->busy.store(false);
 }
 
@@ -822,12 +791,12 @@ void LyricsPlugin::OnTrigger(unsigned int idx)
     case P_PASTE_ALL: PasteGroup(G_ALL); break;
     case P_SAVE_PRESET:
         if (!async_->busy.exchange(true)) {
-            std::thread(SaveDialogThread, async_, BuildPresetText(), GetForegroundWindow()).detach();
+            std::thread(SaveDialogThread, async_, BuildPresetText(), lyr::ForegroundWindowHandle()).detach();
         }
         break;
     case P_LOAD_PRESET:
         if (!async_->busy.exchange(true)) {
-            std::thread(OpenDialogThread, async_, GetForegroundWindow()).detach();
+            std::thread(OpenDialogThread, async_, lyr::ForegroundWindowHandle()).detach();
         }
         break;
     default: break;

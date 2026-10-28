@@ -5,9 +5,12 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shlobj.h>
+#include <commdlg.h>
+#include <objbase.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +21,8 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+
+#pragma comment(lib, "comdlg32.lib")
 
 namespace lyr {
 
@@ -116,6 +121,51 @@ unsigned long long FileStamp(const std::wstring& path)
     unsigned long long t = ((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) |
                            (unsigned long long)d.ftLastWriteTime.dwLowDateTime;
     return t ^ (((unsigned long long)d.nFileSizeLow) << 7) ^ 1ULL;
+}
+
+void* ForegroundWindowHandle() { return (void*)GetForegroundWindow(); }
+
+bool PickSavePath(void* owner, const std::wstring& startDir, const std::wstring& defaultName,
+                  std::wstring& outPath)
+{
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    wchar_t file[MAX_PATH] = {0};
+    wcsncpy(file, defaultName.c_str(), MAX_PATH - 1);
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = (HWND)owner;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Lyrics OSC preset (*.lyrpreset)\0*.lyrpreset\0All files (*.*)\0*.*\0";
+    ofn.lpstrDefExt = L"lyrpreset";
+    ofn.lpstrInitialDir = startDir.c_str();
+    ofn.lpstrTitle = L"Save Lyrics OSC preset";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    bool ok = GetSaveFileNameW(&ofn) != 0;
+    if (ok) outPath = file;
+    CoUninitialize();
+    return ok;
+}
+
+bool PickOpenPath(void* owner, const std::wstring& startDir, std::wstring& outPath)
+{
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    wchar_t file[MAX_PATH] = {0};
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = (HWND)owner;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Lyrics OSC preset (*.lyrpreset)\0*.lyrpreset\0All files (*.*)\0*.*\0";
+    ofn.lpstrInitialDir = startDir.c_str();
+    ofn.lpstrTitle = L"Load Lyrics OSC preset";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+    bool ok = GetOpenFileNameW(&ofn) != 0;
+    if (ok) outPath = file;
+    CoUninitialize();
+    return ok;
 }
 
 static std::wstring Trim(const std::wstring& s)
@@ -233,7 +283,7 @@ void Apply(LyricsState* s, const std::string& addr, const std::vector<OscArg>& a
 {
     if (addr == "/lyrics/next") { if (Pressed(a)) s->Next(); }
     else if (addr == "/lyrics/prev") { if (Pressed(a)) s->Prev(); }
-    else if (addr == "/lyrics/restart") { if (Pressed(a)) s->Restart(); }
+    else if (addr == "/lyrics/restart") { s->Restart(); } // vale cualquier valor: es idempotente
     else if (addr == "/lyrics/clear") { if (Pressed(a)) s->SetBlank(true); }
     else if (addr == "/lyrics/show") { if (Pressed(a)) s->SetBlank(false); }
     else if (addr == "/lyrics/blank") { s->SetBlank(AsInt(a, 1) != 0); }
@@ -256,10 +306,42 @@ void Apply(LyricsState* s, const std::string& addr, const std::vector<OscArg>& a
     }
 }
 
+// Mensajes de navegacion recientes. Sirven para el caso en que un clip acaba de arrancar y
+// todavia no ha dibujado su primer fotograma cuando llega el mensaje (p. ej. el Restart del
+// inicio de una cancion): se le entregan en cuanto el clip empieza a dibujar.
+struct PendingMsg {
+    std::string addr;
+    std::vector<OscArg> args;
+    unsigned long long tickMs = 0;
+};
+std::vector<PendingMsg> gPending; // protegido por gMtx
+const unsigned long long kPendingWindowMs = 1200;
+
+unsigned long long NowMs()
+{
+    using namespace std::chrono;
+    return (unsigned long long)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+bool IsNavAddr(const std::string& a)
+{
+    return a == "/lyrics/next" || a == "/lyrics/prev" || a == "/lyrics/restart" ||
+           a == "/lyrics/goto" || a == "/lyrics/clear" || a == "/lyrics/show" || a == "/lyrics/blank";
+}
+
+void PrunePendingLocked(unsigned long long now)
+{
+    gPending.erase(std::remove_if(gPending.begin(), gPending.end(),
+                                  [&](const PendingMsg& m) { return now - m.tickMs > kPendingWindowMs; }),
+                   gPending.end());
+    if (gPending.size() > 64) gPending.erase(gPending.begin(), gPending.begin() + (gPending.size() - 64));
+}
+
 void Dispatch(const std::string& addr, const std::vector<OscArg>& args)
 {
     static int logged = 0;
     int active = 0;
+    const unsigned long long now = NowMs();
     {
         std::lock_guard<std::mutex> lk(gMtx);
         for (auto* inst : gInst) {
@@ -268,11 +350,35 @@ void Dispatch(const std::string& addr, const std::vector<OscArg>& args)
                 Apply(inst, addr, args);
             }
         }
+        if (IsNavAddr(addr)) {
+            PrunePendingLocked(now);
+            gPending.push_back({addr, args, now});
+        }
     }
-    if (logged < 30) {
+    if (logged < 40) {
         logged++;
         Log("OSC recibido: " + addr + "  (clips activos que lo reciben: " + std::to_string(active) + ")");
     }
+}
+
+// Un clip acaba de empezar a dibujar: recibe el ultimo Restart reciente y todo lo posterior.
+// (Next/Prev sueltos anteriores a un Restart no se entregan.)
+void DeliverPending(LyricsState* s)
+{
+    std::vector<PendingMsg> todo;
+    {
+        std::lock_guard<std::mutex> lk(gMtx);
+        const unsigned long long now = NowMs();
+        PrunePendingLocked(now);
+        int lastRestart = -1;
+        for (size_t i = 0; i < gPending.size(); i++)
+            if (gPending[i].addr == "/lyrics/restart") lastRestart = (int)i;
+        if (lastRestart >= 0) todo.assign(gPending.begin() + lastRestart, gPending.end());
+    }
+    for (auto& m : todo) Apply(s, m.addr, m.args);
+    if (!todo.empty())
+        Log("Clip recien iniciado: aplicados " + std::to_string(todo.size()) +
+            " mensaje(s) OSC que llegaron justo antes de su primer fotograma");
 }
 
 void HandlePacket(const char* buf, int len)
@@ -439,7 +545,14 @@ void LyricsState::GetStatus(int& nLines, int& idx)
     idx = idx_ + 1; // 0 = nada, 1 = primera linea
 }
 
-void LyricsState::Touch() { lastTouch_.store(GetTickCount64()); }
+void LyricsState::Touch()
+{
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long prev = lastTouch_.load();
+    const bool wasActive = prev != 0 && (now - prev) < 1500ULL;
+    lastTouch_.store(now);
+    if (!wasActive) DeliverPending(this);
+}
 
 bool LyricsState::IsActive() const
 {

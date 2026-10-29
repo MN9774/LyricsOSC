@@ -121,17 +121,17 @@ bool RenderText(const std::wstring& text, const Style& st, int w, int h,
     out.assign(npx * 4, 0);
     if (text.empty()) return true;
 
-    // Separar en lineas
-    std::vector<std::wstring> lines;
+    // Parrafos (saltos de linea explicitos)
+    std::vector<std::wstring> paras;
     {
-        size_t s = 0;
+        size_t s0 = 0;
         for (;;) {
-            size_t p = text.find(L'\n', s);
-            std::wstring ln = (p == std::wstring::npos) ? text.substr(s) : text.substr(s, p - s);
+            size_t p = text.find(L'\n', s0);
+            std::wstring ln = (p == std::wstring::npos) ? text.substr(s0) : text.substr(s0, p - s0);
             while (!ln.empty() && ln.back() == L'\r') ln.pop_back();
-            lines.push_back(ln);
+            paras.push_back(ln);
             if (p == std::wstring::npos) break;
-            s = p + 1;
+            s0 = p + 1;
         }
     }
 
@@ -157,50 +157,117 @@ bool RenderText(const std::wstring& text, const Style& st, int w, int h,
     fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsMeasureTrailingSpaces |
                        StringFormatFlagsNoWrap);
 
-    const float margin = (float)w * 0.04f;
-    const float avail = (float)w - 2.0f * margin;
-
-    auto measure = [&](const Font& f, const std::wstring& s) -> float {
-        if (s.empty()) return 0.0f;
-        RectF layout(0, 0, 100000.0f, 100000.0f), box;
-        g.MeasureString(s.c_str(), (INT)s.size(), &f, layout, &fmt, &box);
-        return box.Width;
-    };
+    // Zona de texto: ancho configurable (el texto se parte en lineas, el tamano NO cambia)
+    const float marginY = (float)h * 0.04f;
+    float wf = st.wrapWidth;
+    if (wf < 0.2f) wf = 0.2f;
+    if (wf > 1.0f) wf = 1.0f;
+    const float availW = (float)w * wf;
+    const float availH = (float)h - 2.0f * marginY;
+    const float blockLeft = ((float)w - availW) * 0.5f;
+    const float trackEm = st.tracking;
 
     float size = st.sizePx > 4.0f ? st.sizePx : 4.0f;
-    std::unique_ptr<Font> font(new Font(fam.get(), size, style, UnitPixel));
-    float maxW = 0.0f;
-    for (auto& l : lines) { float lw = measure(*font, l); if (lw > maxW) maxW = lw; }
-    if (maxW > avail && maxW > 0.0f) {
-        size = size * avail / maxW; // auto-ajuste para que quepa
+    std::unique_ptr<Font> font;
+    std::vector<std::wstring> lines;
+    float lineH = 0.0f, step = 0.0f, blockH = 0.0f, maxW = 0.0f;
+
+    auto measure = [&](const std::wstring& s) -> float {
+        if (s.empty()) return 0.0f;
+        RectF layout(0, 0, 100000.0f, 100000.0f), box;
+        g.MeasureString(s.c_str(), (INT)s.size(), font.get(), layout, &fmt, &box);
+        return box.Width;
+    };
+    auto lineWidth = [&](const std::wstring& s) -> float {
+        float wd = measure(s);
+        if (s.size() > 1) wd += (float)(s.size() - 1) * trackEm * size;
+        return wd;
+    };
+
+    // Reparte las palabras en lineas que quepan en availW con el tamano actual
+    auto layoutLines = [&]() {
         font.reset(new Font(fam.get(), size, style, UnitPixel));
+        lines.clear();
+        maxW = 0.0f;
+        for (const std::wstring& para : paras) {
+            if (para.empty()) { lines.push_back(L""); continue; }
+            std::wstring cur;
+            size_t pos = 0;
+            while (pos <= para.size()) {
+                size_t sp = para.find(L' ', pos);
+                std::wstring word = (sp == std::wstring::npos) ? para.substr(pos) : para.substr(pos, sp - pos);
+                pos = (sp == std::wstring::npos) ? para.size() + 1 : sp + 1;
+                if (word.empty()) continue;
+                if (cur.empty()) {
+                    cur = word;
+                } else {
+                    std::wstring cand = cur + L" " + word;
+                    if (lineWidth(cand) <= availW) cur = cand;
+                    else { lines.push_back(cur); cur = word; }
+                }
+            }
+            lines.push_back(cur);
+        }
+        for (const std::wstring& l : lines) {
+            float lw = lineWidth(l);
+            if (lw > maxW) maxW = lw;
+        }
+        lineH = font->GetHeight(&g);
+        step = lineH * st.lineSpacing;
+        blockH = step * (float)(lines.size() - 1) + lineH;
+    };
+
+    layoutLines();
+    // Solo se reduce el tamano si es imprescindible: una palabra mas ancha que la zona,
+    // o un bloque mas alto que la pantalla.
+    for (int it = 0; it < 8; it++) {
+        float sW = maxW > availW + 0.5f ? availW / maxW : 1.0f;
+        float sH = blockH > availH + 0.5f ? availH / blockH : 1.0f;
+        float sc = sW < sH ? sW : sH;
+        if (sc >= 0.999f) break;
+        size *= sc * 0.995f;
+        if (size < 4.0f) { size = 4.0f; layoutLines(); break; }
+        layoutLines();
     }
 
-    const float lineH = font->GetHeight(&g);
-    const float step = lineH * st.lineSpacing;
-    const float blockH = step * (float)(lines.size() - 1) + lineH;
     float top;
-    float room = (float)h - blockH - 2.0f * margin;
+    float room = (float)h - blockH - 2.0f * marginY;
     if (room < 0.0f) top = ((float)h - blockH) * 0.5f;
-    else top = margin + room * (1.0f - st.vertical);
+    else top = marginY + room * (1.0f - st.vertical);
 
-    std::vector<float> charX;
+    std::vector<LineInfo> infos;
     // Todo el texto como un unico trazado (sirve para relleno, contorno, sombra y glow)
     GraphicsPath path(FillModeWinding);
+    const float trackPx = trackEm * size;
     for (size_t i = 0; i < lines.size(); i++) {
-        if (lines[i].empty()) continue;
-        float lw = measure(*font, lines[i]);
+        const std::wstring& ln = lines[i];
+        const float lw = lineWidth(ln);
         float x;
-        if (st.align == 0) x = margin;
-        else if (st.align == 2) x = (float)w - margin - lw;
-        else x = ((float)w - lw) * 0.5f;
-        path.AddString(lines[i].c_str(), (INT)lines[i].size(), fam.get(), style, size,
-                       PointF(x, top + step * (float)i), &fmt);
-        if (lines.size() == 1) {
-            charX.push_back(x);
-            for (size_t k = 1; k <= lines[i].size(); k++)
-                charX.push_back(x + measure(*font, lines[i].substr(0, k)));
+        if (st.align == 0) x = blockLeft;
+        else if (st.align == 2) x = blockLeft + availW - lw;
+        else x = blockLeft + (availW - lw) * 0.5f;
+        const float y = top + step * (float)i;
+
+        LineInfo li;
+        li.topPx = y;
+        li.heightPx = lineH;
+        if (!ln.empty()) {
+            li.charX.push_back(x);
+            if (std::fabs(trackEm) < 0.001f) {
+                path.AddString(ln.c_str(), (INT)ln.size(), fam.get(), style, size, PointF(x, y), &fmt);
+                for (size_t k = 1; k <= ln.size(); k++) li.charX.push_back(x + measure(ln.substr(0, k)));
+            } else {
+                // Con espaciado entre letras cada caracter se coloca por separado
+                for (size_t k = 0; k < ln.size(); k++) {
+                    float px = x + (k == 0 ? 0.0f : measure(ln.substr(0, k))) + trackPx * (float)k;
+                    if (ln[k] != L' ')
+                        path.AddString(&ln[k], 1, fam.get(), style, size, PointF(px, y), &fmt);
+                }
+                for (size_t k = 1; k <= ln.size(); k++)
+                    li.charX.push_back(x + measure(ln.substr(0, k)) + trackPx * (float)(k - 1));
+            }
         }
+        infos.push_back(li);
     }
 
     g.Clear(Color(0, 0, 0, 0));
@@ -329,7 +396,7 @@ bool RenderText(const std::wstring& text, const Style& st, int w, int h,
         res->any = true;
         res->minX = minX; res->maxX = maxX;
         res->minY = minY; res->maxY = maxY;
-        res->charX = charX;
+        res->lines = infos;
     }
     return true;
 }

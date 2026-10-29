@@ -47,6 +47,8 @@ enum ParamID : FFUInt32 {
     P_ALIGN,
     P_POS,
     P_SPACING,
+    P_TRACK,      // espaciado entre letras
+    P_WRAP,       // ancho maximo del texto (se parte en lineas, el tamano no cambia)
     P_BOLD,
     P_ITALIC,
 
@@ -106,7 +108,8 @@ static std::vector<int> GroupParams(int g)
     case G_ALL: {
         // Todo salvo la tipografia y el archivo de la letra
         std::vector<int> all = {(int)P_SIZE, (int)P_COLOR_R, (int)P_COLOR_G, (int)P_COLOR_B,
-                                (int)P_ALIGN, (int)P_POS, (int)P_SPACING, (int)P_BOLD, (int)P_ITALIC};
+                                (int)P_ALIGN, (int)P_POS, (int)P_SPACING, (int)P_TRACK, (int)P_WRAP,
+                                (int)P_BOLD, (int)P_ITALIC};
         for (int k = 0; k < G_ALL; k++) {
             std::vector<int> sub = GroupParams(k);
             all.insert(all.end(), sub.begin(), sub.end());
@@ -126,7 +129,7 @@ struct PresetKey { int id; const char* key; };
 static const PresetKey kPresetKeys[] = {
     {P_SIZE, "size"}, {P_COLOR_R, "colorR"}, {P_COLOR_G, "colorG"}, {P_COLOR_B, "colorB"},
     {P_ALIGN, "align"}, {P_POS, "position"}, {P_SPACING, "lineSpacing"}, {P_BOLD, "bold"},
-    {P_ITALIC, "italic"},
+    {P_ITALIC, "italic"}, {P_TRACK, "letterSpacing"}, {P_WRAP, "wrapWidth"},
     {P_OUT_W, "outlineWidth"}, {P_OUT_R, "outlineR"}, {P_OUT_G, "outlineG"}, {P_OUT_B, "outlineB"},
     {P_SH_OP, "shadowOpacity"}, {P_SH_DIST, "shadowDistance"}, {P_SH_ANGLE, "shadowAngle"},
     {P_SH_BLUR, "shadowBlur"}, {P_SH_R, "shadowR"}, {P_SH_G, "shadowG"}, {P_SH_B, "shadowB"},
@@ -210,12 +213,16 @@ void main()
 // uB = (pivoteX, pivoteY, opacidad)
 // uC = (barridoMin, barridoMax, suavizado)
 // uD = (radio de desenfoque en uv, ancho/alto, 0)
+// uE = (maquina de escribir activa, limite inferior de la linea actual, limite superior)
+// uG = (limite en x de la linea actual, 0, 0)
 static const char* kFragment = R"GLSL(#version 410 core
 uniform sampler2D tex;
 uniform vec3 uA;
 uniform vec3 uB;
 uniform vec3 uC;
 uniform vec3 uD;
+uniform vec3 uE;
+uniform vec3 uG;
 in vec2 uv;
 out vec4 fragColor;
 
@@ -234,6 +241,13 @@ void main()
     }
     float soft = max(uC.z, 0.0001);
     float m = smoothstep(uC.x - soft, uC.x, p.x) * (1.0 - smoothstep(uC.y, uC.y + soft, p.x));
+    if (uE.x > 0.5) {
+        // lineas de arriba: visibles; linea actual: hasta el limite en x; lineas de abajo: ocultas
+        float vis = 0.0;
+        if (p.y > uE.z) vis = 1.0;
+        else if (p.y >= uE.y) vis = 1.0 - step(uG.x, p.x);
+        m *= vis;
+    }
 
     vec4 t;
     float br = uD.x;
@@ -300,7 +314,11 @@ struct Layer {
     bool has = false;
     float bx0 = 0.0f, bx1 = 1.0f; // caja del texto en uv (x)
     float cx = 0.5f, cy = 0.5f;   // centro del texto en uv (y hacia arriba)
-    std::vector<float> charU;     // borde tras cada caracter en uv (maquina de escribir)
+    struct LineBand {             // una linea de texto ya maquetada (maquina de escribir)
+        float yHi = 0.0f, yLo = 0.0f; // limites verticales en uv (y hacia arriba)
+        std::vector<float> charU;     // borde tras cada caracter en uv
+    };
+    std::vector<LineBand> bands;
 };
 
 // Guarda y restaura el estado de OpenGL que tocamos
@@ -473,8 +491,8 @@ LyricsPlugin::LyricsPlugin()
     button(P_FONT_PREV, "Font Prev", "Font -");
     button(P_FONT_NEXT, "Font Next", "Font +");
 
-    values_[P_SIZE] = 0.3f;
-    SetParamInfo(P_SIZE, "Size", FF_TYPE_STANDARD, 0.3f);
+    values_[P_SIZE] = 0.5f;
+    SetParamInfo(P_SIZE, "Size", FF_TYPE_STANDARD, 0.5f);
 
     values_[P_COLOR_R] = values_[P_COLOR_G] = values_[P_COLOR_B] = 1.0f;
     SetParamInfo(P_COLOR_R, "Text Color", FF_TYPE_RED, 1.0f);
@@ -490,10 +508,14 @@ LyricsPlugin::LyricsPlugin()
     values_[P_POS] = 0.5f;
     SetParamInfo(P_POS, "Position", FF_TYPE_STANDARD, 0.5f);
     SetParamInfo(P_SPACING, "Line Spacing", FF_TYPE_STANDARD, 0.0f);
+    values_[P_TRACK] = 0.25f; // 0.25 = espaciado normal
+    values_[P_WRAP] = 0.8f;
+    SetParamInfo(P_TRACK, "Letter Spacing", FF_TYPE_STANDARD, 0.25f);
+    SetParamInfo(P_WRAP, "Wrap Width", FF_TYPE_STANDARD, 0.8f);
     SetParamInfof(P_BOLD, "Bold", FF_TYPE_BOOLEAN);
     SetParamInfof(P_ITALIC, "Italic", FF_TYPE_BOOLEAN);
     group({P_FONT, P_FONT_PREV, P_FONT_NEXT, P_SIZE, P_COLOR_R, P_COLOR_G, P_COLOR_B, P_ALIGN,
-           P_POS, P_SPACING, P_BOLD, P_ITALIC}, "Text");
+           P_POS, P_SPACING, P_TRACK, P_WRAP, P_BOLD, P_ITALIC}, "Text");
 
     // =============== Grupo "Outline"
     button(P_OL_COPY, "Outline Copy", "Copy");
@@ -864,6 +886,18 @@ char* LyricsPlugin::GetParameterDisplay(unsigned int index)
         snprintf(dispBuf_, sizeof(dispBuf_), "%d deg", (int)std::lround(v * 360.0f));
         return dispBuf_;
     }
+    if (index == P_TRACK) {
+        float v;
+        { std::lock_guard<std::mutex> lk(mu_); v = values_[P_TRACK]; }
+        snprintf(dispBuf_, sizeof(dispBuf_), "%.2f em", (v - 0.25f) * 0.4f);
+        return dispBuf_;
+    }
+    if (index == P_WRAP) {
+        float v;
+        { std::lock_guard<std::mutex> lk(mu_); v = values_[P_WRAP]; }
+        snprintf(dispBuf_, sizeof(dispBuf_), "%d %%", (int)std::lround((0.3f + 0.7f * v) * 100.0f));
+        return dispBuf_;
+    }
     if (index == P_IN_TIME || index == P_OUT_TIME) {
         float v;
         { std::lock_guard<std::mutex> lk(mu_); v = values_[index]; }
@@ -968,6 +1002,7 @@ void LyricsPlugin::DrawLayer(const Layer& L, int kind, bool isIn, float e)
 {
     float ox = 0.0f, oy = 0.0f, sc = 1.0f, op = 1.0f, lo = -1.0f, hi = 2.0f, soft = 0.004f;
     float blur = 0.0f;
+    float typeOn = 0.0f, typeLo = 0.0f, typeHi = 1.0f, typeX = 2.0f;
     const float hid = 1.0f - e;
     const float slide = tDist_ * 0.5f;
     const float zoom = tDist_ * 0.8f;
@@ -995,16 +1030,32 @@ void LyricsPlugin::DrawLayer(const Layer& L, int kind, bool isIn, float e)
         op = e;
         break;
     case A_TYPE: {
-        // Maquina de escribir: aparecen letra a letra (al salir se borran desde el final)
-        const int n = L.charU.size() > 1 ? (int)L.charU.size() - 1 : 0;
-        if (n == 0) {
-            lo = L.bx0; hi = L.bx0 + e * bw; // texto de varias lineas: barrido simple
+        // Maquina de escribir: aparecen letra a letra, linea por linea (al salir se borra desde el final)
+        int total = 0;
+        for (const Layer::LineBand& bd : L.bands) total += bd.charU.size() > 1 ? (int)bd.charU.size() - 1 : 0;
+        if (total == 0) {
+            lo = L.bx0; hi = L.bx0 + e * bw; // sin datos de caracteres: barrido simple
         } else {
-            int c = (int)std::floor(e * (float)n + 0.0001f);
+            int c = (int)std::floor(e * (float)total + 0.0001f);
             if (c < 0) c = 0;
-            if (c > n) c = n;
-            if (c == 0) op = 0.0f;
-            else if (c < n) { hi = L.charU[(size_t)c]; soft = 0.0002f; }
+            if (c > total) c = total;
+            if (c == 0) {
+                op = 0.0f;
+            } else if (c < total) {
+                int rem = c;
+                for (const Layer::LineBand& bd : L.bands) {
+                    const int nk = bd.charU.size() > 1 ? (int)bd.charU.size() - 1 : 0;
+                    if (nk == 0) continue;
+                    if (rem <= nk) {
+                        typeOn = 1.0f;
+                        typeLo = bd.yLo;
+                        typeHi = bd.yHi;
+                        typeX = bd.charU[(size_t)rem];
+                        break;
+                    }
+                    rem -= nk;
+                }
+            }
         }
         break;
     }
@@ -1019,6 +1070,8 @@ void LyricsPlugin::DrawLayer(const Layer& L, int kind, bool isIn, float e)
     shader_.Set("uB", L.cx, L.cy, op);
     shader_.Set("uC", lo, hi, soft);
     shader_.Set("uD", blur, (float)w_ / (float)(h_ > 0 ? h_ : 1), 0.0f);
+    shader_.Set("uE", typeOn, typeLo, typeHi);
+    shader_.Set("uG", typeX, 0.0f, 0.0f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
@@ -1077,10 +1130,12 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
         st.font = key.font;
         st.bold = v[P_BOLD] > 0.5f;
         st.italic = v[P_ITALIC] > 0.5f;
-        st.sizePx = h * (0.05f + 0.25f * v[P_SIZE]);
+        st.sizePx = h * (0.04f + 0.30f * v[P_SIZE]); // Size 0.5 = 19 % de la altura, 1.0 = 34 %
         st.align = (int)std::lround(v[P_ALIGN]);
         st.lineSpacing = 1.0f + v[P_SPACING];
         st.vertical = v[P_POS];
+        st.tracking = (v[P_TRACK] - 0.25f) * 0.4f;
+        st.wrapWidth = 0.3f + 0.7f * v[P_WRAP];
         st.fill[0] = v[P_COLOR_R]; st.fill[1] = v[P_COLOR_G]; st.fill[2] = v[P_COLOR_B];
         st.outlineWidthPx = v[P_OUT_W] * 0.02f * h;
         st.outline[0] = v[P_OUT_R]; st.outline[1] = v[P_OUT_G]; st.outline[2] = v[P_OUT_B];
@@ -1098,7 +1153,7 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
                     st.outline[0], st.outline[1], st.outline[2], st.shadowOpacity, st.shadowDistPx,
                     st.shadowAngleDeg, st.shadowBlurPx, st.shadow[0], st.shadow[1], st.shadow[2],
                     st.glowIntensity, st.glowBlurPx, st.glow[0], st.glow[1], st.glow[2],
-                    (float)w_, (float)h_};
+                    st.tracking, st.wrapWidth, (float)w_, (float)h_};
 
         if (!(key == cur_.key)) {
             render::Result rr;
@@ -1113,10 +1168,16 @@ FFResult LyricsPlugin::ProcessOpenGL(ProcessOpenGLStruct* /*pGL*/)
                     cur_.bx1 = (float)(rr.maxX + 1) / (float)w_ + 0.01f;
                     cur_.cx = 0.5f * (cur_.bx0 + cur_.bx1);
                     cur_.cy = 1.0f - 0.5f * (float)(rr.minY + rr.maxY + 1) / (float)h_;
-                    cur_.charU.clear();
-                    for (float px : rr.charX) cur_.charU.push_back(px / (float)w_);
+                    cur_.bands.clear();
+                    for (const render::LineInfo& li : rr.lines) {
+                        Layer::LineBand b;
+                        b.yHi = 1.0f - li.topPx / (float)h_;
+                        b.yLo = 1.0f - (li.topPx + li.heightPx) / (float)h_;
+                        for (float px : li.charX) b.charU.push_back(px / (float)w_);
+                        cur_.bands.push_back(b);
+                    }
                 } else {
-                    cur_.charU.clear();
+                    cur_.bands.clear();
                     cur_.bx0 = 0.0f; cur_.bx1 = 1.0f; cur_.cx = 0.5f; cur_.cy = 0.5f;
                 }
             }
